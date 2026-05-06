@@ -3,6 +3,7 @@
 #include "MainWindow.xaml.h"
 #include "Rendering/RenderEngine.h"
 #include "Rendering/GraphEvaluator.h"
+#include "Rendering/D3DDefinitions.h"
 #include "Graph/EffectGraph.h"
 #include "Effects/SourceNodeFactory.h"
 #include "Effects/CustomPixelShaderEffect.h"
@@ -341,7 +342,7 @@ namespace winrt::ShaderLab::implementation
         // Initialize without a swap chain panel — just device resources.
         // We need a minimal init path. Use the internal CreateDeviceResources.
         // For now, use a simpler approach: create device directly.
-        UINT d3dFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        UINT d3dFlags = DefaultD3D11DeviceFlags;
         D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
         winrt::com_ptr<ID3D11Device> baseDevice;
         winrt::com_ptr<ID3D11DeviceContext> baseCtx;
@@ -513,7 +514,7 @@ namespace winrt::ShaderLab::implementation
         LOG("[TEST] Creating device (%s)...",
             devicePref == ::ShaderLab::Rendering::DevicePreference::Warp ? "WARP" : "Hardware");
 
-        UINT d3dFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        UINT d3dFlags = DefaultD3D11DeviceFlags;
         D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
         winrt::com_ptr<ID3D11Device> baseDevice;
         winrt::com_ptr<ID3D11DeviceContext> baseCtx;

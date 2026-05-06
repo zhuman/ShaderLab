@@ -7,6 +7,7 @@
 #include "Effects/ShaderCompiler.h"
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
+#include "Rendering/D3DDefinitions.h"
 
 #include <cstdio>
 #include <cmath>
@@ -526,7 +527,7 @@ int main(int argc, char* argv[])
     printf("=====================\n");
 
     // Create D3D11 device.
-    UINT d3dFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    UINT d3dFlags = DefaultD3D11DeviceFlags;
     D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
     winrt::com_ptr<ID3D11Device> baseDevice;
     winrt::com_ptr<ID3D11DeviceContext> baseCtx;

@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "RenderEngine.h"
+#include "D3DDefinitions.h"
 
 #include <microsoft.ui.xaml.media.dxinterop.h>
 
@@ -64,7 +65,7 @@ namespace ShaderLab::Rendering
             CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(m_dxgiFactory.put())));
 
         // --- D3D11 Device ---
-        UINT d3dFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT; // required for D2D interop
+        UINT d3dFlags = DefaultD3D11DeviceFlags; // required for D2D interop
         D3D_FEATURE_LEVEL featureLevels[] = {
             D3D_FEATURE_LEVEL_11_1,
             D3D_FEATURE_LEVEL_11_0,
