@@ -38,6 +38,8 @@ namespace ShaderLab::Controls
         void CreateSwapChain();
         void CreateRenderTarget();
         void ReleaseRenderTarget();
+        void ResizeForPanelSize(double widthDips, double heightDips);
+        void UpdatePanelScale();
         void OnPanelSizeChanged(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& args);
@@ -86,6 +88,7 @@ namespace ShaderLab::Controls
 
         // Event tokens for cleanup.
         winrt::event_token m_sizeChangedToken{};
+        winrt::event_token m_compositionScaleChangedToken{};
         winrt::event_token m_closedToken{};
     };
 }

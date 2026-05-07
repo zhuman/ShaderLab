@@ -154,18 +154,15 @@ namespace ShaderLab::Controls
             {
                 try
                 {
-                    auto scale = static_cast<double>(m_panel.CompositionScaleX());
-                    m_width = static_cast<uint32_t>((std::max)(1.0, m_panel.ActualWidth() * scale));
-                    m_height = static_cast<uint32_t>((std::max)(1.0, m_panel.ActualHeight() * scale));
-
-                    if (m_width > 0 && m_height > 0)
-                    {
-                        CreateSwapChain();
-                        CreateRenderTarget();
-                    }
+                    ResizeForPanelSize(m_panel.ActualWidth(), m_panel.ActualHeight());
 
                     m_sizeChangedToken = m_panel.SizeChanged(
                         { this, &OutputWindow::OnPanelSizeChanged });
+                    m_compositionScaleChangedToken = m_panel.CompositionScaleChanged([this](auto&&, auto&&)
+                    {
+                        UpdatePanelScale();
+                        ResizeForPanelSize(m_panel.ActualWidth(), m_panel.ActualHeight());
+                    });
                 }
                 catch (...)
                 {
@@ -264,7 +261,11 @@ namespace ShaderLab::Controls
                 dc->SetTransform(
                     D2D1::Matrix3x2F::Scale(m_zoom, m_zoom) *
                     D2D1::Matrix3x2F::Translation(m_panX, m_panY));
-                dc->DrawImage(image);
+                dc->DrawImage(
+                    image,
+                    m_zoom < 1.0f
+                        ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
+                        : D2D1_INTERPOLATION_MODE_LINEAR);
             }
             else
             {
@@ -345,6 +346,8 @@ namespace ShaderLab::Controls
             {
                 if (m_panel && m_sizeChangedToken.value != 0)
                     m_panel.SizeChanged(m_sizeChangedToken);
+                if (m_panel && m_compositionScaleChangedToken.value != 0)
+                    m_panel.CompositionScaleChanged(m_compositionScaleChangedToken);
                 m_window.Close();
             }
             catch (...) {}
@@ -404,6 +407,25 @@ namespace ShaderLab::Controls
 
         auto panelNative = m_panel.as<ISwapChainPanelNative>();
         panelNative->SetSwapChain(m_swapChain.get());
+        UpdatePanelScale();
+    }
+
+    void OutputWindow::UpdatePanelScale()
+    {
+        if (!m_swapChain || !m_panel)
+            return;
+
+        winrt::com_ptr<IDXGISwapChain2> swapChain2;
+        if (FAILED(m_swapChain->QueryInterface(IID_PPV_ARGS(swapChain2.put()))))
+            return;
+
+        float scaleX = (std::max)(1.0f, static_cast<float>(m_panel.CompositionScaleX()));
+        float scaleY = (std::max)(1.0f, static_cast<float>(m_panel.CompositionScaleY()));
+
+        DXGI_MATRIX_3X2_F matrix{};
+        matrix._11 = 1.0f / scaleX;
+        matrix._22 = 1.0f / scaleY;
+        swapChain2->SetMatrixTransform(&matrix);
     }
 
     void OutputWindow::CreateRenderTarget()
@@ -440,9 +462,15 @@ namespace ShaderLab::Controls
         winrt::Windows::Foundation::IInspectable const& /*sender*/,
         winrt::Microsoft::UI::Xaml::SizeChangedEventArgs const& args)
     {
-        auto scale = static_cast<double>(m_panel.CompositionScaleX());
-        uint32_t w = static_cast<uint32_t>((std::max)(1.0, args.NewSize().Width * scale));
-        uint32_t h = static_cast<uint32_t>((std::max)(1.0, args.NewSize().Height * scale));
+        ResizeForPanelSize(args.NewSize().Width, args.NewSize().Height);
+    }
+
+    void OutputWindow::ResizeForPanelSize(double widthDips, double heightDips)
+    {
+        auto scaleX = static_cast<double>((std::max)(1.0f, static_cast<float>(m_panel.CompositionScaleX())));
+        auto scaleY = static_cast<double>((std::max)(1.0f, static_cast<float>(m_panel.CompositionScaleY())));
+        uint32_t w = static_cast<uint32_t>((std::max)(1.0, std::ceil(widthDips * scaleX)));
+        uint32_t h = static_cast<uint32_t>((std::max)(1.0, std::ceil(heightDips * scaleY)));
 
         if (w == m_width && h == m_height)
             return;

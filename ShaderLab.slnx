@@ -6,6 +6,9 @@
   </Configurations>
   <Project Path="ShaderLabEngine.vcxproj" Id="a7a1e0f1-665c-4d06-9ac7-6d6b6a0d0f01" />
   <Project Path="ShaderLabTests.vcxproj" Id="c1d2e3f4-1122-4b33-9c44-556677889900" />
+  <Folder Name="/Solution Items/">
+    <File Path="nuget.config" />
+  </Folder>
   <Project Path="ShaderLab.vcxproj" Id="a1b2c3d4-e5f6-7890-abcd-ef1234567890">
     <Deploy Solution="*|x64" />
     <Deploy Solution="*|ARM64" />

@@ -453,6 +453,8 @@ namespace winrt::ShaderLab::implementation
         winrt::com_ptr<ID2D1Bitmap1>      m_traceSwatchTarget;
         uint32_t m_traceSwatchHeight{ 0 };
         void InitializeTraceSwatchPanel();
+        void ResizeTraceSwatchPanel();
+        void UpdateTraceSwatchPanelScale();
         void RenderTraceSwatches();
     };
 }

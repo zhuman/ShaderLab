@@ -176,6 +176,19 @@ namespace winrt::ShaderLab::implementation
                 static_cast<float>(NodeGraphPanel().ActualWidth()),
                 static_cast<float>(NodeGraphPanel().ActualHeight()));
         });
+        PreviewPanel().CompositionScaleChanged([this](auto&&, auto&&)
+        {
+            OnPreviewSizeChanged(PreviewPanel(), nullptr);
+        });
+        TraceSwatchPanel().SizeChanged([this](auto&&, auto&&)
+        {
+            ResizeTraceSwatchPanel();
+        });
+        TraceSwatchPanel().CompositionScaleChanged([this](auto&&, auto&&)
+        {
+            UpdateTraceSwatchPanelScale();
+            ResizeTraceSwatchPanel();
+        });
         NodeGraphContainer().PointerPressed({ this, &MainWindow::OnGraphPanelPointerPressed });
         NodeGraphContainer().PointerMoved({ this, &MainWindow::OnGraphPanelPointerMoved });
         NodeGraphContainer().PointerReleased({ this, &MainWindow::OnGraphPanelPointerReleased });
@@ -1010,9 +1023,13 @@ namespace winrt::ShaderLab::implementation
         if (!m_renderEngine.IsInitialized())
             return;
 
-        auto scale = PreviewPanel().CompositionScaleX();
-        auto w = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(args.NewSize().Width) * scale));
-        auto h = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(args.NewSize().Height) * scale));
+        auto panel = PreviewPanel();
+        double width = args ? args.NewSize().Width : panel.ActualWidth();
+        double height = args ? args.NewSize().Height : panel.ActualHeight();
+        auto scaleX = static_cast<float>(panel.CompositionScaleX());
+        auto scaleY = static_cast<float>(panel.CompositionScaleY());
+        auto w = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(std::ceil(width * scaleX))));
+        auto h = static_cast<uint32_t>((std::max)(1.0f, static_cast<float>(std::ceil(height * scaleY))));
         m_renderEngine.Resize(w, h);
     }
 
@@ -3198,9 +3215,17 @@ namespace winrt::ShaderLab::implementation
         if (m_traceSwapChain || !m_renderEngine.DXGIFactory() || !m_renderEngine.D3DDevice())
             return;
 
+        auto panel = TraceSwatchPanel();
+        float scaleX = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleX()));
+        float scaleY = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleY()));
+        auto width = static_cast<uint32_t>((std::max)(1.0f, std::ceil(static_cast<float>(panel.ActualWidth()) * scaleX)));
+        auto height = static_cast<uint32_t>((std::max)(1.0f, std::ceil(static_cast<float>(panel.ActualHeight()) * scaleY)));
+        if (width == 0) width = static_cast<uint32_t>(std::ceil(28.0f * scaleX));
+        if (height == 0) height = static_cast<uint32_t>(std::ceil(600.0f * scaleY));
+
         DXGI_SWAP_CHAIN_DESC1 desc{};
-        desc.Width = 28;
-        desc.Height = 600;
+        desc.Width = width;
+        desc.Height = height;
         desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc.SampleDesc.Count = 1;
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -3215,8 +3240,9 @@ namespace winrt::ShaderLab::implementation
             dxgiDevice.get(), &desc, nullptr, m_traceSwapChain.put());
         if (FAILED(hr)) return;
 
-        auto panelNative = TraceSwatchPanel().as<ISwapChainPanelNative>();
+        auto panelNative = panel.as<ISwapChainPanelNative>();
         panelNative->SetSwapChain(m_traceSwapChain.get());
+        UpdateTraceSwatchPanelScale();
 
         // Set scRGB color space for HDR rendering.
         winrt::com_ptr<IDXGISwapChain3> sc3;
@@ -3224,7 +3250,7 @@ namespace winrt::ShaderLab::implementation
         if (sc3)
             sc3->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
 
-        m_traceSwatchHeight = 600;
+        m_traceSwatchHeight = height;
 
         auto* dc = m_renderEngine.D2DDeviceContext();
         winrt::com_ptr<IDXGISurface> surface;
@@ -3234,6 +3260,55 @@ namespace winrt::ShaderLab::implementation
             D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
             D2D1::PixelFormat(DXGI_FORMAT_R16G16B16A16_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED));
         dc->CreateBitmapFromDxgiSurface(surface.get(), bmpProps, m_traceSwatchTarget.put());
+    }
+
+    void MainWindow::ResizeTraceSwatchPanel()
+    {
+        if (!m_traceSwapChain)
+            return;
+
+        auto panel = TraceSwatchPanel();
+        float scaleX = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleX()));
+        float scaleY = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleY()));
+        auto width = static_cast<uint32_t>((std::max)(1.0f, std::ceil(static_cast<float>(panel.ActualWidth()) * scaleX)));
+        auto height = static_cast<uint32_t>((std::max)(1.0f, std::ceil(static_cast<float>(panel.ActualHeight()) * scaleY)));
+
+        if (height == m_traceSwatchHeight)
+            return;
+
+        m_traceSwatchHeight = height;
+        m_traceSwatchTarget = nullptr;
+        m_traceSwapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+
+        auto* dc = m_renderEngine.D2DDeviceContext();
+        if (!dc) return;
+
+        winrt::com_ptr<IDXGISurface> surface;
+        m_traceSwapChain->GetBuffer(0, IID_PPV_ARGS(surface.put()));
+
+        D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(DXGI_FORMAT_R16G16B16A16_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED));
+        dc->CreateBitmapFromDxgiSurface(surface.get(), bmpProps, m_traceSwatchTarget.put());
+    }
+
+    void MainWindow::UpdateTraceSwatchPanelScale()
+    {
+        if (!m_traceSwapChain)
+            return;
+
+        winrt::com_ptr<IDXGISwapChain2> swapChain2;
+        if (FAILED(m_traceSwapChain->QueryInterface(IID_PPV_ARGS(swapChain2.put()))))
+            return;
+
+        auto panel = TraceSwatchPanel();
+        float scaleX = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleX()));
+        float scaleY = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleY()));
+
+        DXGI_MATRIX_3X2_F matrix{};
+        matrix._11 = 1.0f / scaleX;
+        matrix._22 = 1.0f / scaleY;
+        swapChain2->SetMatrixTransform(&matrix);
     }
 
     void MainWindow::RenderTraceSwatches()
@@ -3254,7 +3329,9 @@ namespace winrt::ShaderLab::implementation
 
         float oldDpiX, oldDpiY;
         dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
+        auto traceDpiX = 96.0f * (std::max)(1.0f, static_cast<float>(TraceSwatchPanel().CompositionScaleX()));
+        auto traceDpiY = 96.0f * (std::max)(1.0f, static_cast<float>(TraceSwatchPanel().CompositionScaleY()));
+        dc->SetDpi(traceDpiX, traceDpiY);
 
         dc->SetTarget(m_traceSwatchTarget.get());
         dc->BeginDraw();
@@ -6778,7 +6855,7 @@ namespace winrt::ShaderLab::implementation
         if (previewImage)
         {
             drawDc->SetTransform(previewTransform);
-            drawDc->DrawImage(previewImage);
+            drawDc->DrawImage(previewImage, m_previewZoom < 1.0 ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC : D2D1_INTERPOLATION_MODE_LINEAR);
         }
         else if (m_previewNodeId != 0)
         {
