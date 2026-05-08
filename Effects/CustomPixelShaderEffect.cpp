@@ -154,7 +154,8 @@ namespace ShaderLab::Effects
                 static_cast<UINT32>(m_shaderBytecode.size()));
 
             if (SUCCEEDED(hr))
-                hr = m_drawInfo->SetPixelShader(m_shaderGuid);
+                hr = m_drawInfo->SetPixelShader(m_shaderGuid,
+                    D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING);
 
             if (FAILED(hr))
                 return hr;
@@ -361,71 +362,19 @@ namespace ShaderLab::Effects
 
         for (const auto& var : variables)
         {
-            // Find a matching property by name.
             auto it = properties.find(var.name);
             if (it == properties.end())
                 continue;
-
-            // Write the value at the correct offset (guard against out-of-range offsets).
             if (var.offset >= cbSizeBytes)
                 continue;
 
             BYTE* dest = m_constantBuffer.data() + var.offset;
             uint32_t remaining = cbSizeBytes - var.offset;
 
-            std::visit([dest, remaining, &var](auto&& v)
-            {
-                using T = std::decay_t<decltype(v)>;
-                if constexpr (std::is_same_v<T, float>)
-                {
-                    if (remaining >= sizeof(float))
-                        memcpy(dest, &v, sizeof(float));
-                }
-                else if constexpr (std::is_same_v<T, int32_t>)
-                {
-                    if (remaining >= sizeof(int32_t))
-                        memcpy(dest, &v, sizeof(int32_t));
-                }
-                else if constexpr (std::is_same_v<T, uint32_t>)
-                {
-                    if (remaining >= sizeof(uint32_t))
-                        memcpy(dest, &v, sizeof(uint32_t));
-                }
-                else if constexpr (std::is_same_v<T, bool>)
-                {
-                    BOOL bval = v ? TRUE : FALSE;
-                    if (remaining >= sizeof(BOOL))
-                        memcpy(dest, &bval, sizeof(BOOL));
-                }
-                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float2>)
-                {
-                    if (remaining >= sizeof(float) * 2)
-                    {
-                        memcpy(dest, &v.x, sizeof(float));
-                        memcpy(dest + sizeof(float), &v.y, sizeof(float));
-                    }
-                }
-                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float3>)
-                {
-                    if (remaining >= sizeof(float) * 3)
-                    {
-                        memcpy(dest, &v.x, sizeof(float));
-                        memcpy(dest + sizeof(float), &v.y, sizeof(float));
-                        memcpy(dest + sizeof(float) * 2, &v.z, sizeof(float));
-                    }
-                }
-                else if constexpr (std::is_same_v<T, winrt::Windows::Foundation::Numerics::float4>)
-                {
-                    if (remaining >= sizeof(float) * 4)
-                    {
-                        memcpy(dest, &v.x, sizeof(float));
-                        memcpy(dest + sizeof(float), &v.y, sizeof(float));
-                        memcpy(dest + sizeof(float) * 2, &v.z, sizeof(float));
-                        memcpy(dest + sizeof(float) * 3, &v.w, sizeof(float));
-                    }
-                }
-                // std::wstring: not applicable to constant buffers — skip.
-            }, it->second);
+            // Typed pack: converts float -> uint/int/bool and respects
+            // the declared HLSL cbuffer slot type. See
+            // ShaderCompiler.cpp::PackPropertyToCBuffer (Phase 3).
+            PackPropertyToCBuffer(dest, remaining, var.type, var.columns, it->second);
         }
 
         m_cbDirty = true;

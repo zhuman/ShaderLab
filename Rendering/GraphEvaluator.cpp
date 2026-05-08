@@ -1,13 +1,80 @@
 #include "pch_engine.h"
 #include "GraphEvaluator.h"
 #include "../Effects/ShaderCompiler.h"
-#include "../Effects/StatisticsEffect.h"
+#include "../Effects/BytecodeCache.h"
+#include "../Effects/Performance.h"
+#include "../Effects/IEngineComputeOutput.h"
 #include "MathExpression.h"
 
 using namespace ShaderLab::Graph;
 
 namespace ShaderLab::Rendering
 {
+    // ---- Phase 8 cache routing helpers (file-scope) -----------------------
+    //
+    // Build a BytecodeCompileRequest from a node's CustomEffectDefinition,
+    // then synchronously fetch-or-compile via BytecodeCache. Centralizes
+    // the canonicalize -> hash -> request pattern shared by:
+    //   * ShaderLab built-in effects (PixelShader / D2D-tiled compute), and
+    //   * D3D11 compute custom effects (the bridge's lazy compile).
+    //
+    // gpuBindableNames is filtered from def.parameters in stable index
+    // order; today no built-in effect sets gpuBindable=true so the list is
+    // empty and the bitset is 0 (= the baseline variant).
+    namespace {
+        Effects::BytecodeCacheResult CompileViaCache(
+            const std::wstring& effectId,
+            uint32_t            effectVersion,
+            const std::wstring& hlslSource,
+            const std::string&  target,
+            uint32_t            macroBitset,
+            const std::vector<std::string>& gpuBindableNames)
+        {
+            std::string canonical = Effects::CanonicalizeHlslSource(hlslSource);
+
+            Effects::BytecodeCompileRequest req;
+            req.key.sourceHash         = Effects::HashCanonicalSource(canonical);
+            req.key.paramSignatureHash = Effects::HashParamSignature(gpuBindableNames);
+            req.key.includeLibraryHash = Effects::IncludeLibraryHash();
+            req.key.macroBitset        = macroBitset;
+            req.key.entryPoint         = "main";
+            req.key.target             = target;
+            req.metadata.effectId      = effectId;
+            req.metadata.version       = effectVersion;
+            req.hlslSource             = std::move(canonical);
+            req.gpuBindableParamNames  = gpuBindableNames;
+
+            return Effects::BytecodeCache::Instance().GetOrCompile(std::move(req));
+        }
+
+        // Filter a definition's parameters to those flagged gpuBindable,
+        // returning their UTF-8 names in declared order. Empty today
+        // (no built-in effect has gpuBindable=true) but ready for
+        // p8-migrate-ictcp.
+        std::vector<std::string> ExtractGpuBindableNames(
+            const ShaderLab::Graph::CustomEffectDefinition& def)
+        {
+            std::vector<std::string> names;
+            names.reserve(def.parameters.size());
+            for (const auto& p : def.parameters)
+            {
+                if (!p.gpuBindable) continue;
+                std::string utf8;
+                int needed = ::WideCharToMultiByte(
+                    CP_UTF8, 0, p.name.data(), static_cast<int>(p.name.size()),
+                    nullptr, 0, nullptr, nullptr);
+                if (needed > 0)
+                {
+                    utf8.resize(static_cast<size_t>(needed));
+                    ::WideCharToMultiByte(
+                        CP_UTF8, 0, p.name.data(), static_cast<int>(p.name.size()),
+                        utf8.data(), needed, nullptr, nullptr);
+                }
+                names.push_back(std::move(utf8));
+            }
+            return names;
+        }
+    }
     // -----------------------------------------------------------------------
     // Main evaluation entry point
     // -----------------------------------------------------------------------
@@ -173,11 +240,37 @@ namespace ShaderLab::Rendering
                     bool hasImageOutput = !node->outputPins.empty();
                     // Image-producing compute: recompute when dirty or no cached output.
                     // Analysis-only compute: also recompute if no analysis fields yet.
+                    //
+                    // Phase 8c regression fix: when skip-readback is on, ALL
+                    // compute nodes must redispatch every frame regardless
+                    // of dirty state. Pre-skip-readback the per-frame
+                    // upstream dirty-propagation in OnRenderTick lit up
+                    // compute consumers via image edges, but inside this
+                    // EvaluateNode the upstream's `dirty` has already been
+                    // cleared (Source case clears it before downstream eval
+                    // runs) so we can't use it here. The host's upstream
+                    // propagation does set node->dirty for us when Source
+                    // ticks, but ResolveBindings on the consumer of an
+                    // analysis source (e.g. ICtCp <- LumStats.Mean) only
+                    // dirties the consumer when CPU value changes -- which
+                    // never happens when LumStats's Map() was throttled.
+                    // Force redispatch for every compute node so the GPU
+                    // dispatch fires and the structured-buffer / image-
+                    // output texture are kept fresh.
+                    const bool skipReadbackForcesRedispatch =
+                        Performance::IsSkipUnneededCpuReadbackEnabled();
                     bool needsCompute = node->dirty ||
+                        skipReadbackForcesRedispatch ||
                         (hasImageOutput && !node->cachedOutput) ||
                         (!hasImageOutput && node->analysisOutput.fields.empty());
-                    if (inputImage && needsCompute)
+                    if (inputImage && needsCompute && !m_deferredComputeFrozen)
                     {
+                        // Phase 8: ensure the bridge effect exists for this
+                        // node so ProcessDeferredCompute can drive it via
+                        // ICustomComputeBridge. CreateOrGetEffect captures
+                        // the impl into m_bridgeImplCache.
+                        GetOrCreateEffect(dc, *node);
+
                         // For image-producing compute, pre-render the upstream
                         // D2D chain to a bitmap NOW while properties are fresh.
                         // This avoids D2D GPU caching returning stale data when
@@ -393,21 +486,35 @@ namespace ShaderLab::Rendering
                     auto& def = node->customEffect.value();
                     std::string target = (def.shaderType == CustomShaderType::PixelShader)
                         ? "ps_5_0" : "cs_5_0";
-                    std::string hlslUtf8(def.hlslSource.begin(), def.hlslSource.end());
-                    for (auto& ch : hlslUtf8)
-                        if (ch == '\r') ch = '\n';
-                    auto result = Effects::ShaderCompiler::CompileFromString(hlslUtf8, "ShaderLabEffect", "main", target);
-                    if (result.succeeded)
+                    auto gpuNames = ExtractGpuBindableNames(def);
+                    auto cached = CompileViaCache(
+                        node->name, /*effectVersion*/ 1u,
+                        def.hlslSource, target, /*macroBitset*/ 0u, gpuNames);
+                    if (cached.status == Effects::BytecodeStatus::Ready)
                     {
-                        auto* blob = result.bytecode.get();
-                        def.compiledBytecode.resize(blob->GetBufferSize());
-                        memcpy(def.compiledBytecode.data(), blob->GetBufferPointer(), blob->GetBufferSize());
+                        def.compiledBytecode = std::move(cached.bytecode);
                         CoCreateGuid(&def.shaderGuid);
                         node->dirty = true;
+                        // Phase 8 eager precompile: kick off background
+                        // compiles for the +N gpu-binding variants so
+                        // they're warm if the user later wires a binding
+                        // to a gpuBindable param. Idempotent (the cache
+                        // dedupes by key); fires once per node per session
+                        // since this branch runs only on !isCompiled().
+                        if (!gpuNames.empty())
+                        {
+                            Effects::BytecodeCacheMetadata meta;
+                            meta.effectId = node->name;
+                            meta.version  = 1u;
+                            Effects::BytecodeCache::Instance().PrecompileCommonShapes(
+                                meta,
+                                Effects::CanonicalizeHlslSource(def.hlslSource),
+                                "main", target, gpuNames);
+                        }
                     }
                     else
                     {
-                        node->runtimeError = L"Auto-compile failed: " + result.ErrorMessage();
+                        node->runtimeError = L"Auto-compile failed: " + cached.errorMessage;
                         node->cachedOutput = nullptr;
                         m_outputCache.erase(nodeId);
                         break;
@@ -430,6 +537,59 @@ namespace ShaderLab::Rendering
                     std::map<std::wstring, PropertyValue> effectiveProps;
                     bool bindingsChanged = ResolveBindings(*node, graph, effectiveProps);
                     bool wasDirty = node->dirty || bindingsChanged;
+
+                    // Inject host-driven output dimensions for shaders that
+                    // declare OutputW / OutputH cbuffer fields. D2D pads input
+                    // textures to atlas allocation sizes (typically 4096x4096),
+                    // so HLSL `Texture2D::GetDimensions()` is unreliable for
+                    // anything that needs the true output rect (e.g. Split
+                    // Comparisons center-of-image pivot). The shader uses
+                    // these values instead.
+                    bool declaresOutputDims = false;
+                    if (node->customEffect->shaderType == Graph::CustomShaderType::PixelShader)
+                    {
+                        for (const auto& p : node->customEffect->parameters)
+                        {
+                            if (p.name == L"OutputW" || p.name == L"OutputH")
+                            { declaresOutputDims = true; break; }
+                        }
+                    }
+                    if (declaresOutputDims)
+                    {
+                        auto inputs = graph.GetInputEdges(nodeId);
+                        if (!inputs.empty())
+                        {
+                            auto* srcNode = graph.FindNode(inputs[0]->sourceNodeId);
+                            if (srcNode && srcNode->cachedOutput && dc)
+                            {
+                                float oldDpiX = 0, oldDpiY = 0;
+                                dc->GetDpi(&oldDpiX, &oldDpiY);
+                                dc->SetDpi(96.0f, 96.0f);
+                                D2D1_RECT_F bounds{};
+                                dc->GetImageLocalBounds(srcNode->cachedOutput, &bounds);
+                                dc->SetDpi(oldDpiX, oldDpiY);
+                                float w = bounds.right - bounds.left;
+                                float h = bounds.bottom - bounds.top;
+                                if (w > 0 && h > 0)
+                                {
+                                    auto wIt = effectiveProps.find(L"OutputW");
+                                    auto hIt = effectiveProps.find(L"OutputH");
+                                    bool changed =
+                                        (wIt == effectiveProps.end() ||
+                                         !std::holds_alternative<float>(wIt->second) ||
+                                         std::get<float>(wIt->second) != w) ||
+                                        (hIt == effectiveProps.end() ||
+                                         !std::holds_alternative<float>(hIt->second) ||
+                                         std::get<float>(hIt->second) != h);
+                                    effectiveProps[L"OutputW"] = w;
+                                    effectiveProps[L"OutputH"] = h;
+                                    node->properties[L"OutputW"] = w;
+                                    node->properties[L"OutputH"] = h;
+                                    if (changed) wasDirty = true;
+                                }
+                            }
+                        }
+                    }
 
                     // Write resolved binding values back to node properties
                     // so the node graph UI shows live bound values.
@@ -566,51 +726,745 @@ namespace ShaderLab::Rendering
 
         bool imageComputeProduced = false;
 
+        // Phase 8c: build the per-frame "needs CPU readback" set. When
+        // the skip-readback feature flag is OFF, the set is treated as
+        // covering every node (preserves pre-Phase-8c behavior). When
+        // ON, a node lands in the set if either:
+        //   (1) it is hinted by the host via SetCpuAnalysisInterest
+        //       (UI selected node, MCP target, etc.), or
+        //   (2) at least one downstream property binding that consumes
+        //       this node's analysis output is NOT served via the GPU
+        //       SRV path (CanServeBindingViaGpu returned false).
+        // Nodes not in the set skip the CopyResource + Map round-trip;
+        // their `analysisOutput.fields` retains last-frame values.
+        const bool skipFlag = Performance::IsSkipUnneededCpuReadbackEnabled();
+        std::unordered_set<uint32_t> needsReadback;
+        if (skipFlag)
+        {
+            // Throttle host-hint readbacks (selected node, canvas value
+            // labels) to Performance::CpuAnalysisHintThrottleMs. CPU-
+            // routed bindings (added below) are unaffected because the
+            // consumer reads `analysisOutput.fields` every frame.
+            const auto throttle = std::chrono::milliseconds(
+                Performance::CpuAnalysisHintThrottleMs());
+            const auto nowTs = std::chrono::steady_clock::now();
+            for (uint32_t id : m_cpuAnalysisInterest)
+            {
+                auto it = m_lastHintReadbackTime.find(id);
+                const bool freshHint = (it == m_lastHintReadbackTime.end());
+                const bool dueAgain = !freshHint && (nowTs - it->second) >= throttle;
+                if (freshHint || dueAgain || throttle.count() == 0)
+                    needsReadback.insert(id);
+            }
+            // Add every source whose binding cannot be GPU-served. These
+            // are the consumers actual data dependencies and run every
+            // frame regardless of throttle.
+            for (const auto& consumerNode : graph.Nodes())
+            {
+                for (const auto& [propName, binding] : consumerNode.propertyBindings)
+                {
+                    bool gpuServed =
+                        CanServeBindingViaGpu(consumerNode, propName, binding, graph);
+                    if (gpuServed) continue;
+                    for (const auto& srcOpt : binding.sources)
+                    {
+                        if (srcOpt.has_value())
+                            needsReadback.insert(srcOpt->sourceNodeId);
+                    }
+                }
+            }
+        }
+        auto isReadbackNeeded = [&](uint32_t nodeId) -> bool
+        {
+            return !skipFlag || needsReadback.count(nodeId) > 0;
+        };
+
+        // Phase 8 perf: pre-render each unique upstream input ONCE
+        // per frame and share the FP32 bitmap across all deferred-
+        // compute consumers that share it. Without this, a graph
+        // like {Source -> 4 stats + ICtCp Tone Map} pays 5x the
+        // upstream-render cost (each bridge re-rendered the source
+        // into its own private FP32 bitmap).
+        //
+        // We do the SetTarget+Clear+DrawImage inline (NOT via
+        // PreRenderInputBitmap, which nests BeginDraw and breaks
+        // submission inside an outer draw session). dc->Flush() forces
+        // the commands out before the bridge's D3D11 compute reads.
+        // Cache key is the raw ID2D1Image pointer of the upstream's
+        // cachedOutput; cleared at end of ProcessDeferredCompute.
+        struct SharedFp32 {
+            winrt::com_ptr<ID2D1Bitmap1> bitmap;
+            UINT32 width{ 0 };
+            UINT32 height{ 0 };
+        };
+        std::unordered_map<ID2D1Image*, SharedFp32> sharedPreRender;
+
+        auto preRenderShared = [&](ID2D1Image* inputImage) -> ID2D1Bitmap1*
+        {
+            auto it = sharedPreRender.find(inputImage);
+            if (it != sharedPreRender.end()) return it->second.bitmap.get();
+
+            float oldDpiX = 0, oldDpiY = 0;
+            dc->GetDpi(&oldDpiX, &oldDpiY);
+            dc->SetDpi(96.0f, 96.0f);
+
+            D2D1_RECT_F bounds{};
+            dc->GetImageLocalBounds(inputImage, &bounds);
+            UINT32 w = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
+            UINT32 h = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
+            if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
+
+            // Reuse the previous frame's bitmap if dimensions match;
+            // otherwise allocate a new one.
+            auto& cacheBitmap = m_sharedPreRenderCache[inputImage];
+            if (!cacheBitmap.bitmap || cacheBitmap.width != w || cacheBitmap.height != h)
+            {
+                D2D1_BITMAP_PROPERTIES1 bp{};
+                bp.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+                bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+                bp.dpiX = 96.0f;
+                bp.dpiY = 96.0f;
+                winrt::com_ptr<ID2D1Bitmap1> newBmp;
+                HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bp, newBmp.put());
+                if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
+                cacheBitmap.bitmap = std::move(newBmp);
+                cacheBitmap.width  = w;
+                cacheBitmap.height = h;
+            }
+
+            // Render upstream into the cached bitmap. Inline pattern
+            // (no nested BeginDraw); Flush forces submit before the
+            // bridge's D3D11 compute reads.
+            winrt::com_ptr<ID2D1Image> prevTarget;
+            dc->GetTarget(prevTarget.put());
+            dc->SetTarget(cacheBitmap.bitmap.get());
+            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+            dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+            dc->SetTarget(prevTarget.get());
+            dc->Flush();
+            dc->SetDpi(oldDpiX, oldDpiY);
+
+            SharedFp32 s;
+            s.bitmap = cacheBitmap.bitmap;
+            s.width  = w;
+            s.height = h;
+            auto* ptr = s.bitmap.get();
+            sharedPreRender[inputImage] = std::move(s);
+            return ptr;
+        };
+
         for (auto& deferred : m_deferredCompute)
         {
             auto* node = graph.FindNode(deferred.nodeId);
             if (!node || !deferred.inputImage) continue;
+            if (!node->customEffect.has_value()) continue;
 
-            // Image-producing compute nodes (have output pins) use a dedicated
-            // path that creates a GPU output texture → D2D bitmap → cachedOutput.
+            auto bit = m_bridgeImplCache.find(node->id);
+            if (bit == m_bridgeImplCache.end() || !bit->second)
+                continue;
+            auto* bridge = bit->second;
+
+            // Use the deferred entry's pre-rendered bitmap if it
+            // exists (image-producing computes pre-render in
+            // EvaluateNode while D2D effect properties are fresh).
+            // Otherwise share via the per-frame map.
+            ID2D1Bitmap1* preRendered = deferred.preRenderedInput.get();
+            if (!preRendered)
+                preRendered = preRenderShared(deferred.inputImage);
+
+            const bool readback = isReadbackNeeded(node->id);
+            DispatchViaBridge(dc, graph, *node, deferred.inputImage,
+                preRendered, bridge, readback);
+
+            // Phase 8c: record the timestamp for hinted nodes whose
+            // readback actually ran this frame so the throttle window
+            // starts now. Bindings-driven readbacks (consumer needs CPU
+            // value) intentionally don't update this map -- they fire
+            // every frame regardless of throttle.
+            if (readback && skipFlag && m_cpuAnalysisInterest.count(node->id))
+                m_lastHintReadbackTime[node->id] = std::chrono::steady_clock::now();
+
             bool hasImageOutput = !node->outputPins.empty();
-            if (hasImageOutput && node->customEffect.has_value())
+            if (hasImageOutput && node->cachedOutput)
             {
-                DispatchImageCompute(dc, *node, deferred.inputImage, deferred.preRenderedInput.get());
-                if (node->cachedOutput)
+                imageComputeProduced = true;
+                std::vector<uint32_t> queue = { node->id };
+                for (size_t i = 0; i < queue.size(); ++i)
                 {
-                    imageComputeProduced = true;
-                    // Mark all downstream nodes dirty so they re-evaluate
-                    // on the next frame with the new histogram input.
-                    std::vector<uint32_t> queue = { node->id };
-                    for (size_t i = 0; i < queue.size(); ++i)
+                    for (const auto* edge : graph.GetOutputEdges(queue[i]))
                     {
-                        for (const auto* edge : graph.GetOutputEdges(queue[i]))
+                        auto* dn = graph.FindNode(edge->destNodeId);
+                        if (dn && !dn->dirty)
                         {
-                            auto* dn = graph.FindNode(edge->destNodeId);
-                            if (dn && !dn->dirty)
-                            {
-                                dn->dirty = true;
-                                queue.push_back(edge->destNodeId);
-                            }
+                            dn->dirty = true;
+                            queue.push_back(edge->destNodeId);
                         }
                     }
                 }
-                continue;
             }
-
-            // All ShaderLab compute-shader effects flow through the
-            // generic D3D11ComputeRunner path. There used to be a
-            // hardcoded fast-path here for the legacy "Image Statistics"
-            // effect via ComputeImageStatistics + GpuReduction; that
-            // effect was split into Channel/Luminance/Chromaticity
-            // Statistics, all of which use the per-shader cbuffer
-            // dispatched by DispatchUserD3D11Compute. New compute
-            // effects need no special-casing in the host.
-            DispatchUserD3D11Compute(dc, *node, deferred.inputImage);
         }
+
         m_deferredCompute.clear();
         return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Bridge-based D3D11 compute dispatch (Phase 8)
+    // -----------------------------------------------------------------------
+    //
+    // Replaces the pre-Phase-8 DispatchUserD3D11Compute (analysis-only)
+    // and DispatchImageCompute (image-producing) paths. Both flows now
+    // go through CustomComputeBridgeEffect::Dispatch, which:
+    //   * pre-renders the upstream D2D chain to an FP32 bitmap,
+    //   * lazily compiles the shader on first call (or uses installed
+    //     bytecode),
+    //   * dispatches with optional u1 image-output binding,
+    //   * reads back analysis floats and exposes the analysis SRV via
+    //     IEngineComputeOutput for downstream Phase 8 GPU-binding
+    //     consumers,
+    //   * wraps the image-output texture as an ID2D1Bitmap1.
+
+    void GraphEvaluator::DispatchViaBridge(
+        ID2D1DeviceContext5* dc,
+        const EffectGraph& graph,
+        EffectNode& node,
+        ID2D1Image* inputImage,
+        ID2D1Bitmap1* preRenderedInput,
+        Effects::CustomComputeBridgeEffect* bridge,
+        bool readbackToCpu)
+    {
+        if (!bridge) return;
+        auto& def = node.customEffect.value();
+
+        // Lazy compile: ProcessDeferredCompute runs inside BeginDraw so
+        // we have a valid D3D11 device on the DC. If the host hasn't
+        // already populated def.compiledBytecode (e.g. the editor or
+        // an MCP /effect/compile call), compile via ShaderCompiler and
+        // hand the bytecode to the bridge. Subsequent dispatches reuse
+        // the installed shader.
+        if (def.compiledBytecode.empty())
+        {
+            auto gpuNames = ExtractGpuBindableNames(def);
+            auto cached = CompileViaCache(
+                node.name, /*effectVersion*/ 1u,
+                def.hlslSource, "cs_5_0", /*macroBitset*/ 0u, gpuNames);
+            if (cached.status != Effects::BytecodeStatus::Ready)
+            {
+                node.runtimeError = cached.errorMessage.empty()
+                    ? L"D3D11 compute shader compile failed"
+                    : std::move(cached.errorMessage);
+                return;
+            }
+            def.compiledBytecode = std::move(cached.bytecode);
+            bridge->SetCompiledBytecode(def.compiledBytecode.data(),
+                static_cast<UINT32>(def.compiledBytecode.size()));
+            node.runtimeError.clear();
+            // Phase 8 eager precompile (mirror of the ShaderLab built-in
+            // case in EvaluateNode).
+            if (!gpuNames.empty())
+            {
+                Effects::BytecodeCacheMetadata meta;
+                meta.effectId = node.name;
+                meta.version  = 1u;
+                Effects::BytecodeCache::Instance().PrecompileCommonShapes(
+                    meta,
+                    Effects::CanonicalizeHlslSource(def.hlslSource),
+                    "main", "cs_5_0", gpuNames);
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Phase 8 GPU-binding plan
+        // -----------------------------------------------------------------
+        // Walk gpuBindable params in declaration order. For each one
+        // that has a binding from an upstream effect implementing
+        // IEngineComputeOutput, capture (paramIndex, slot, srv) and
+        // set the corresponding bit in macroBitset. Slot follows the
+        // convention: gpuBindable param at index i binds to t<i+1>
+        // (t0 is reserved for the input texture). HLSL authors using
+        // SHADERLAB_GPU_BUFFER must pick consistent slot numbers.
+        struct GpuBindingEntry {
+            uint32_t                                 gpuBindableIndex;
+            uint32_t                                 slot;
+            uint32_t                                 fieldIndex;   // float4 index in upstream's analysis SRV
+            std::wstring                             paramName;    // for _SLIdx_<name> cbuffer slot lookup
+            winrt::com_ptr<ID3D11ShaderResourceView> srv;
+        };
+        std::vector<GpuBindingEntry> bindingPlan;
+        uint32_t macroBitset = 0;
+        const std::vector<uint8_t>* reflectBytecode = &def.compiledBytecode;
+        std::vector<uint8_t> variantBytecode;
+
+        if (Performance::IsGpuBindingsEnabled())
+        {
+            uint32_t gpuBindableIdx = 0;
+            for (const auto& p : def.parameters)
+            {
+                if (!p.gpuBindable)
+                    continue;
+                const uint32_t thisGpuIdx = gpuBindableIdx++;
+
+                auto bIt = node.propertyBindings.find(p.name);
+                if (bIt == node.propertyBindings.end())
+                    continue;
+                const auto& binding = bIt->second;
+                if (binding.wholeArray ||
+                    binding.sources.empty() ||
+                    !binding.sources[0].has_value())
+                    continue;
+
+                uint32_t srcId = binding.sources[0]->sourceNodeId;
+                // Discover via m_bridgeImplCache (the bridge impl
+                // pointer captured at CreateEffect time). D2D's outer
+                // ID2D1Effect's QueryInterface doesn't delegate
+                // arbitrary IIDs to the impl, so we use the impl
+                // pointer directly. The bridge implements
+                // IEngineComputeOutput by delegation to its internal
+                // D3D11ComputeRunner.
+                auto bridgeIt = m_bridgeImplCache.find(srcId);
+                if (bridgeIt == m_bridgeImplCache.end() || !bridgeIt->second)
+                    continue;
+                winrt::com_ptr<Effects::IEngineComputeOutput> ieco;
+                if (FAILED(bridgeIt->second->QueryInterface(
+                    __uuidof(Effects::IEngineComputeOutput), ieco.put_void())))
+                    continue;
+
+                winrt::com_ptr<ID3D11ShaderResourceView> srv;
+                if (FAILED(ieco->GetAnalysisSrv(srv.put())) || !srv)
+                    continue;
+
+                // Compute the upstream field's float4 index in the
+                // analysis SRV. The upstream's CustomEffectDefinition
+                // declares analysis fields in order; each field
+                // occupies pixelCount() float4 slots (floats / float2 /
+                // float3 / float4 = 1 slot each; arrays = arrayLength
+                // * 1 slot per element). Walk the prefix-sum until we
+                // hit the bound source field name.
+                const EffectNode* srcNode = graph.FindNode(srcId);
+                if (!srcNode || !srcNode->customEffect.has_value())
+                    continue;
+                uint32_t fieldIndex = 0;
+                bool fieldFound = false;
+                for (const auto& fd : srcNode->customEffect->analysisFields)
+                {
+                    if (fd.name == binding.sources[0]->sourceFieldName)
+                    {
+                        fieldIndex += binding.sources[0]->sourceIndex;
+                        fieldFound = true;
+                        break;
+                    }
+                    fieldIndex += fd.pixelCount();
+                }
+                if (!fieldFound)
+                    continue;
+
+                bindingPlan.push_back({
+                    thisGpuIdx,
+                    thisGpuIdx + 1u,
+                    fieldIndex,
+                    p.name,
+                    std::move(srv) });
+                macroBitset |= (1u << thisGpuIdx);
+                // (telemetry already bumped by ResolveBindings; no
+                // double-count here.)
+            }
+
+            // If we're routing any binding GPU-side, swap to the
+            // variant bytecode (compiled with _SLPARAM_<name>_GPU=1
+            // for the bits set). Eagerly precompiled at first encounter
+            // (commit 74eb9a5), so this is typically a cache hit.
+            if (macroBitset != 0)
+            {
+                auto gpuNames = ExtractGpuBindableNames(def);
+                auto variant = CompileViaCache(
+                    node.name, /*effectVersion*/ 1u,
+                    def.hlslSource, "cs_5_0", macroBitset, gpuNames);
+                if (variant.status == Effects::BytecodeStatus::Ready)
+                {
+                    variantBytecode  = std::move(variant.bytecode);
+                    reflectBytecode  = &variantBytecode;
+                    bridge->SetCompiledBytecode(
+                        variantBytecode.data(),
+                        static_cast<UINT32>(variantBytecode.size()));
+                }
+                else
+                {
+                    // Variant unavailable -- gracefully fall back to
+                    // baseline (cbuffer mode for all params; CPU
+                    // readback path stays as the source of truth).
+                    bindingPlan.clear();
+                    macroBitset = 0;
+                }
+            }
+        }
+
+        // Analysis float4 count: sum over typed-field pixel counts.
+        UINT32 analysisFloat4Count = 0;
+        for (const auto& f : def.analysisFields)
+            analysisFloat4Count += f.pixelCount();
+
+        // Image-output dimensions: DiagramSize / OutputSize for square
+        // viewers, or OutputWidth + OutputHeight for non-square viewers,
+        // fallback to upstream input bounds. 0/0 = analysis-only (no
+        // u1 binding).
+        UINT32 imageOutW = 0, imageOutH = 0;
+        bool hasImageOutput = !node.outputPins.empty();
+        if (hasImageOutput)
+        {
+            // Pass 1: explicit OutputWidth + OutputHeight (non-square).
+            UINT32 explicitW = 0, explicitH = 0;
+            for (const auto& [key, val] : node.properties)
+            {
+                if (key == L"OutputWidth")
+                {
+                    if (auto* f = std::get_if<float>(&val))
+                        explicitW = static_cast<UINT32>((std::max)(*f, 64.0f));
+                    else if (auto* u = std::get_if<uint32_t>(&val))
+                        explicitW = (std::max)(*u, 64u);
+                }
+                else if (key == L"OutputHeight")
+                {
+                    if (auto* f = std::get_if<float>(&val))
+                        explicitH = static_cast<UINT32>((std::max)(*f, 64.0f));
+                    else if (auto* u = std::get_if<uint32_t>(&val))
+                        explicitH = (std::max)(*u, 64u);
+                }
+            }
+            if (explicitW > 0 && explicitH > 0)
+            {
+                imageOutW = explicitW;
+                imageOutH = explicitH;
+            }
+            // Pass 2: square sizing via DiagramSize / OutputSize.
+            if (imageOutW == 0)
+            {
+                for (const auto& p : def.parameters)
+                {
+                    if (p.name == L"DiagramSize" || p.name == L"OutputSize")
+                    {
+                        auto it = node.properties.find(p.name);
+                        if (it != node.properties.end())
+                        {
+                            if (auto* f = std::get_if<float>(&it->second))
+                                imageOutW = imageOutH = static_cast<UINT32>((std::max)(*f, 64.0f));
+                            else if (auto* u = std::get_if<uint32_t>(&it->second))
+                                imageOutW = imageOutH = (std::max)(*u, 64u);
+                        }
+                        break;
+                    }
+                }
+            }
+            if (imageOutW == 0)
+            {
+                // Fall back to upstream input dimensions (96 DPI bounds
+                // from the pre-rendered bitmap, if any, else the input
+                // image's bounds).
+                if (preRenderedInput)
+                {
+                    auto sz = preRenderedInput->GetPixelSize();
+                    imageOutW = sz.width; imageOutH = sz.height;
+                }
+                else
+                {
+                    float oldDpiX, oldDpiY;
+                    dc->GetDpi(&oldDpiX, &oldDpiY);
+                    dc->SetDpi(96.0f, 96.0f);
+                    D2D1_RECT_F bounds{};
+                    dc->GetImageLocalBounds(inputImage, &bounds);
+                    imageOutW = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
+                    imageOutH = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
+                    dc->SetDpi(oldDpiX, oldDpiY);
+                }
+                if (imageOutW < 64) imageOutW = 64;
+                if (imageOutH < 64) imageOutH = 64;
+            }
+        }
+
+        // Pack cbuffer (user portion only -- the runner prepends
+        // Width/Height). Use the typed PackPropertyToCBuffer helper
+        // (Phase 3) so HLSL `uint`/`int`/`bool` slots receive the
+        // correctly converted scalar instead of a float bit pattern.
+        // Reflection runs against the variant bytecode if we swapped;
+        // GPU-bound params simply have no cbuffer slot in the variant
+        // and PackPropertyToCBuffer skips them naturally.
+        std::vector<BYTE> cbBytes;
+        if (!def.parameters.empty() && !reflectBytecode->empty())
+        {
+            winrt::com_ptr<ID3D11ShaderReflection> reflect;
+            HRESULT hr = D3DReflect(
+                reflectBytecode->data(), reflectBytecode->size(),
+                IID_ID3D11ShaderReflection, reinterpret_cast<void**>(reflect.put()));
+            if (SUCCEEDED(hr) && reflect)
+            {
+                auto* cbReflect = reflect->GetConstantBufferByIndex(0);
+                D3D11_SHADER_BUFFER_DESC cbDesc{};
+                if (cbReflect && SUCCEEDED(cbReflect->GetDesc(&cbDesc)) && cbDesc.Size > 8)
+                {
+                    UINT32 userSize = cbDesc.Size - 8;
+                    cbBytes.assign(userSize, BYTE{ 0 });
+                    for (UINT v = 0; v < cbDesc.Variables; ++v)
+                    {
+                        auto* var = cbReflect->GetVariableByIndex(v);
+                        D3D11_SHADER_VARIABLE_DESC varDesc{};
+                        if (!var || FAILED(var->GetDesc(&varDesc))) continue;
+                        if (varDesc.StartOffset < 8) continue; // skip Width/Height
+
+                        std::wstring varName(varDesc.Name, varDesc.Name + strlen(varDesc.Name));
+                        UINT32 destOff = varDesc.StartOffset - 8;
+                        if (destOff >= cbBytes.size()) continue;
+                        UINT32 remaining = static_cast<UINT32>(cbBytes.size() - destOff);
+
+                        // Phase 8 GPU-binding index slot. Variant
+                        // bytecode declares a `uint _SLIdx_<paramName>;`
+                        // for each gpuBindable param routed via SRV.
+                        // The host packs the upstream's float4 index
+                        // here so the consumer's shader reads the right
+                        // slot via _SLBuf_<name>[_SLIdx_<name>].
+                        if (varName.starts_with(L"_SLIdx_"))
+                        {
+                            std::wstring paramName = varName.substr(7);
+                            for (const auto& e : bindingPlan)
+                            {
+                                if (e.paramName == paramName)
+                                {
+                                    uint32_t idx = e.fieldIndex;
+                                    if (remaining >= sizeof(uint32_t))
+                                        memcpy(cbBytes.data() + destOff, &idx, sizeof(uint32_t));
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+
+                        auto propIt = node.properties.find(varName);
+                        if (propIt == node.properties.end()) continue;
+
+                        D3D11_SHADER_TYPE_DESC typeDesc{};
+                        D3D_SHADER_VARIABLE_TYPE hlslType = D3D_SVT_FLOAT;
+                        UINT cols = 1;
+                        if (auto* typeInfo = var->GetType();
+                            typeInfo && SUCCEEDED(typeInfo->GetDesc(&typeDesc)))
+                        {
+                            hlslType = typeDesc.Type;
+                            cols = typeDesc.Columns;
+                        }
+
+                        Effects::PackPropertyToCBuffer(
+                            cbBytes.data() + destOff, remaining,
+                            hlslType, cols, propIt->second);
+                    }
+                }
+            }
+        }
+
+        // Drive the dispatch through the bridge. The bridge handles
+        // pre-rendering internally; if we have a pre-rendered bitmap
+        // it's a cheap blit (same FP32 format). Use it directly when
+        // available so D2D doesn't re-evaluate upstream effects with
+        // potentially-different cached state.
+        ID2D1Image* dispatchInput = preRenderedInput
+            ? static_cast<ID2D1Image*>(preRenderedInput)
+            : inputImage;
+
+        // Phase 8 GPU bindings: register each upstream SRV with its
+        // declared t-slot. Bridge clears these at the end of Dispatch.
+        for (const auto& e : bindingPlan)
+            bridge->SetGpuBinding(e.slot, e.srv.get());
+
+        // Image-producing per-pixel computes need dispatch dims that
+        // cover the full output. analysis-only and "fixed-size loop"
+        // image producers (e.g. CIE Histogram, Vectorscope) keep (1,1,1)
+        // because their shader does its own internal iteration over the
+        // source pixels into groupshared accumulators.
+        //
+        // Heuristic for "single group" vs "per-pixel tile":
+        //   * Effects whose descriptor declares a `DiagramSize` /
+        //     `OutputSize` parameter are visualization viewers that
+        //     compute their output independently of the source resolution.
+        //     Their shader assumes ONE thread group covers the whole
+        //     output. Tiling them across the output (W/tx, H/ty)
+        //     dispatches the same redundant histogram-of-the-whole-image
+        //     N times -- on a 4K source feeding a 512x512 CIE Histogram
+        //     that's a 256x amplification of an already heavy inner
+        //     loop. Keep dispatch at (1,1,1) for these.
+        //   * Otherwise tile per-pixel (the ICtCp Tone Map style: each
+        //     thread group covers a [numthreads] tile of the output).
+        if (hasImageOutput && imageOutW > 0 && imageOutH > 0 &&
+            def.threadGroupX > 0 && def.threadGroupY > 0)
+        {
+            bool isFixedSizeViewer = false;
+            for (const auto& p : def.parameters)
+            {
+                if (p.name == L"DiagramSize"  ||
+                    p.name == L"OutputSize"   ||
+                    p.name == L"OutputWidth"  ||
+                    p.name == L"OutputHeight")
+                {
+                    isFixedSizeViewer = true;
+                    break;
+                }
+            }
+            const bool perPixelTiling =
+                !isFixedSizeViewer &&
+                def.threadGroupX * def.threadGroupY >= 4 &&
+                def.threadGroupY >= 2;
+            if (perPixelTiling)
+            {
+                UINT32 dx = (imageOutW + def.threadGroupX - 1) / def.threadGroupX;
+                UINT32 dy = (imageOutH + def.threadGroupY - 1) / def.threadGroupY;
+                bridge->SetDispatchDims(dx, dy, 1);
+            }
+        }
+
+        std::vector<float> analysisFloats;
+        // Phase 8c: pass nullptr for outAnalysisFloats when readback is
+        // not needed; the bridge interprets that as "skip the Map" and
+        // returns an empty `floats` vector. The structured-buffer SRV
+        // is still populated on the GPU side for downstream consumers.
+        HRESULT hr = bridge->Dispatch(
+            dc, dispatchInput,
+            cbBytes.empty() ? nullptr : cbBytes.data(),
+            static_cast<UINT32>(cbBytes.size()),
+            analysisFloat4Count,
+            imageOutW, imageOutH,
+            readbackToCpu ? &analysisFloats : nullptr);
+
+        if (!readbackToCpu)
+            Performance::IncrementSkippedCpuReadbacks();
+
+        // After dispatch, restore the baseline bytecode on the bridge
+        // so a subsequent dispatch with a different binding plan starts
+        // from a known state. Cheap since bridge keeps both blobs as
+        // bytecode pointers; CreateComputeShader is the only D3D cost
+        // and the cache returns the same bytes for the same key.
+        if (macroBitset != 0 && !def.compiledBytecode.empty())
+        {
+            bridge->SetCompiledBytecode(
+                def.compiledBytecode.data(),
+                static_cast<UINT32>(def.compiledBytecode.size()));
+        }
+
+        if (FAILED(hr))
+        {
+            node.runtimeError = std::format(L"Bridge dispatch failed 0x{:08X}",
+                static_cast<uint32_t>(hr));
+            return;
+        }
+        node.runtimeError.clear();
+
+        // Unpack analysis floats into typed fields. Phase 8c: only
+        // overwrite when readback actually ran -- skip-readback frames
+        // leave `node.analysisOutput.fields` at the previous-frame
+        // values (or empty if never populated). Hosts that need fresh
+        // values must include the node in
+        // `GraphEvaluator::SetCpuAnalysisInterest` (see Performance.h).
+        if (readbackToCpu && analysisFloat4Count > 0)
+        {
+            node.analysisOutput.type = AnalysisOutputType::Typed;
+            node.analysisOutput.fields.clear();
+            UINT32 pixelOffset = 0;
+            for (const auto& fd : def.analysisFields)
+            {
+                AnalysisFieldValue fv;
+                fv.name = fd.name;
+                fv.type = fd.type;
+
+                UINT32 pc = fd.pixelCount();
+                bool isArray = AnalysisFieldIsArray(fd.type);
+                UINT32 cc = AnalysisFieldComponentCount(fd.type);
+
+                if (!isArray)
+                {
+                    if (pixelOffset * 4 < analysisFloats.size())
+                    {
+                        for (UINT32 c = 0; c < cc && (pixelOffset * 4 + c) < analysisFloats.size(); ++c)
+                            fv.components[c] = analysisFloats[pixelOffset * 4 + c];
+                    }
+                }
+                else
+                {
+                    fv.arrayData.resize(fd.arrayLength * cc, 0.0f);
+                    for (UINT32 i = 0; i < fd.arrayLength; ++i)
+                    {
+                        UINT32 base = (pixelOffset + i) * 4;
+                        for (UINT32 c = 0; c < cc && (base + c) < analysisFloats.size(); ++c)
+                            fv.arrayData[i * cc + c] = analysisFloats[base + c];
+                    }
+                }
+                pixelOffset += pc;
+                node.analysisOutput.fields.push_back(std::move(fv));
+            }
+        }
+
+        // Image-producing nodes wire their output to the bridge's
+        // wrapped bitmap. Downstream nodes consume node->cachedOutput
+        // directly, same as for D2D-tiled compute / pixel-shader nodes.
+        if (hasImageOutput)
+            node.cachedOutput = bridge->GetImageOutput();
+        else
+            node.cachedOutput = nullptr;
+    }
+
+    // Phase 8c: predicate matching the GPU-routability checks used inside
+    // DispatchViaBridge (see bindingPlan construction). Conservative:
+    // any condition that would cause DispatchViaBridge to skip GPU
+    // routing for the binding returns false here, so the pre-pass
+    // counts the source as needing CPU readback. Keep this in sync
+    // with the bindingPlan construction in DispatchViaBridge -- if a
+    // new GPU-routability requirement is added there, mirror it here.
+    bool GraphEvaluator::CanServeBindingViaGpu(
+        const EffectNode&         consumer,
+        const std::wstring&       paramName,
+        const Graph::PropertyBinding& binding,
+        const EffectGraph&        graph) const
+    {
+        if (!Performance::IsGpuBindingsEnabled())
+            return false;
+        // Consumer must be a D3D11 compute custom effect (only the
+        // CustomComputeBridgeEffect can wire upstream SRVs at t-slots).
+        // Pixel-shader / D2D-tiled / built-in D2D effects always go CPU.
+        if (!consumer.customEffect.has_value())
+            return false;
+        if (consumer.customEffect->shaderType != Graph::CustomShaderType::D3D11ComputeShader)
+            return false;
+        // Single-component bindings only -- multi-source per-component
+        // packing always goes CPU.
+        if (binding.wholeArray ||
+            binding.sources.empty() ||
+            binding.sources.size() > 1 ||
+            !binding.sources[0].has_value())
+            return false;
+        // Target parameter must be flagged gpuBindable.
+        const auto& def = consumer.customEffect.value();
+        const Graph::ParameterDefinition* paramDef = nullptr;
+        for (const auto& p : def.parameters)
+        {
+            if (p.name == paramName) { paramDef = &p; break; }
+        }
+        if (!paramDef || !paramDef->gpuBindable)
+            return false;
+        // Source bridge must exist and expose IEngineComputeOutput. We
+        // don't actually call GetAnalysisSrv here (it can fail before
+        // first dispatch); presence of the bridge in m_bridgeImplCache
+        // and a customEffect on the source is the predicate. The
+        // pre-pass runs before DispatchViaBridge during the same
+        // ProcessDeferredCompute, so by the time the consumer
+        // dispatches, the upstream's runner has produced its SRV.
+        const uint32_t srcId = binding.sources[0]->sourceNodeId;
+        auto bridgeIt = m_bridgeImplCache.find(srcId);
+        if (bridgeIt == m_bridgeImplCache.end() || !bridgeIt->second)
+            return false;
+        const EffectNode* srcNode = graph.FindNode(srcId);
+        if (!srcNode || !srcNode->customEffect.has_value())
+            return false;
+        // Source field must exist on the upstream's analysisFields.
+        const auto& srcFieldName = binding.sources[0]->sourceFieldName;
+        bool fieldFound = false;
+        for (const auto& fd : srcNode->customEffect->analysisFields)
+        {
+            if (fd.name == srcFieldName) { fieldFound = true; break; }
+        }
+        return fieldFound;
     }
 
     // -----------------------------------------------------------------------
@@ -622,9 +1476,9 @@ namespace ShaderLab::Rendering
         m_effectCache.clear();
         m_outputCache.clear();
         m_customImplCache.clear();
-        m_d3d11RunnerCache.clear();
-        m_imageComputeCache.clear();
-        m_imageComputeTexCache.clear();
+        m_bridgeImplCache.clear();
+        m_sharedPreRenderCache.clear();
+        m_lastHintReadbackTime.clear();
         m_dummySourceBitmap = nullptr;
     }
 
@@ -645,10 +1499,8 @@ namespace ShaderLab::Rendering
     {
         m_effectCache.erase(nodeId);
         m_outputCache.erase(nodeId);
-        m_d3d11RunnerCache.erase(nodeId);
         m_customImplCache.erase(nodeId);
-        m_imageComputeCache.erase(nodeId);
-        m_imageComputeTexCache.erase(nodeId);
+        m_bridgeImplCache.erase(nodeId);
         // Note: caller must also clear EffectNode::cachedOutput on the node
         // (the raw pointer it holds is now dangling). Prefer the graph-aware
         // overload below.
@@ -693,13 +1545,14 @@ namespace ShaderLab::Rendering
 
         auto& def = node.customEffect.value();
 
-        // D3D11 compute shaders don't use D2D effects — just invalidate the runner.
+        // D3D11 compute shaders: clear the bridge cache so the next
+        // CreateOrGetEffect creates a fresh bridge with the new bytecode.
         if (def.shaderType == CustomShaderType::D3D11ComputeShader)
         {
-            m_d3d11RunnerCache.erase(nodeId);
+            m_effectCache.erase(nodeId);
+            m_bridgeImplCache.erase(nodeId);
             return;
         }
-
         auto implIt = m_customImplCache.find(nodeId);
         if (implIt == m_customImplCache.end())
             return; // First compile — next Evaluate() will create the effect.
@@ -753,7 +1606,23 @@ namespace ShaderLab::Rendering
         // For custom effects, use the per-definition shaderGuid as the CLSID
         // and register with the exact number of inputs.
         GUID clsid{};
-        if ((node.type == NodeType::PixelShader || node.type == NodeType::ComputeShader) &&
+        bool isD3D11Compute = node.customEffect.has_value() &&
+            node.customEffect->shaderType == CustomShaderType::D3D11ComputeShader;
+
+        if (isD3D11Compute)
+        {
+            // Phase 8: D3D11 compute custom effects route through the
+            // shared CustomComputeBridgeEffect. The bridge satisfies
+            // D2D's "one input -> one output" contract via a passthrough
+            // pixel shader; the actual D3D11 compute dispatch happens
+            // out-of-band in ProcessDeferredCompute via QI for
+            // ICustomComputeBridge. Single CLSID for all instances --
+            // bytecode is set per-instance after CreateEffect via
+            // SetCompiledBytecode. The bridge is registered once at
+            // engine startup in RegisterEngineD2DEffects.
+            clsid = Effects::CustomComputeBridgeEffect::CLSID_CustomComputeBridge;
+        }
+        else if ((node.type == NodeType::PixelShader || node.type == NodeType::ComputeShader) &&
             node.customEffect.has_value() && node.customEffect->isCompiled())
         {
             clsid = node.customEffect->shaderGuid;
@@ -797,6 +1666,7 @@ namespace ShaderLab::Rendering
         // Clear thread-local impl pointers before CreateEffect.
         Effects::CustomPixelShaderEffect::s_lastCreated = nullptr;
         Effects::CustomComputeShaderEffect::s_lastCreated = nullptr;
+        Effects::CustomComputeBridgeEffect::s_lastCreated = nullptr;
 
         winrt::com_ptr<ID2D1Effect> effect;
         // Set pending input count BEFORE CreateEffect so the constructor
@@ -838,7 +1708,7 @@ namespace ShaderLab::Rendering
             if (node.customEffect.has_value() && node.customEffect->inputNames.empty())
             {
                 UINT32 outW = 512, outH = 512;
-                // Look for OutputSize/DiagramSize/PlateSize/GradSize/PatternSize/PatchSize/ScopeSize property.
+                // Look for OutputSize/DiagramSize/PlateSize/GradSize/PatternSize/PatchSize property.
                 for (const auto& [key, val] : node.properties)
                 {
                     if (key.find(L"Size") != std::wstring::npos ||
@@ -867,6 +1737,24 @@ namespace ShaderLab::Rendering
         else if (node.type == NodeType::ComputeShader && Effects::CustomComputeShaderEffect::s_lastCreated)
         {
             m_customImplCache[node.id] = { nullptr, Effects::CustomComputeShaderEffect::s_lastCreated };
+        }
+        else if (isD3D11Compute && Effects::CustomComputeBridgeEffect::s_lastCreated)
+        {
+            // Phase 8: bridge effect captured. Install pre-compiled
+            // bytecode now if the host has it (compiled via
+            // ShaderCompiler at MCP /effect/compile time or by the
+            // editor on Ctrl+Enter). If not yet compiled, the
+            // ProcessDeferredCompute pass will compile lazily on
+            // first dispatch and call SetCompiledBytecode then.
+            auto* bridge = Effects::CustomComputeBridgeEffect::s_lastCreated;
+            m_bridgeImplCache[node.id] = bridge;
+            if (node.customEffect.has_value() &&
+                !node.customEffect->compiledBytecode.empty())
+            {
+                bridge->SetCompiledBytecode(
+                    node.customEffect->compiledBytecode.data(),
+                    static_cast<UINT32>(node.customEffect->compiledBytecode.size()));
+            }
         }
 
         auto* raw = effect.get();
@@ -1060,6 +1948,47 @@ namespace ShaderLab::Rendering
         {
             auto propIt = effectiveProps.find(propName);
             if (propIt == effectiveProps.end()) continue;
+
+            // Phase 8: detect GPU-routable bindings before doing CPU
+            // readback. A binding is GPU-routable when:
+            //   * the feature flag is on,
+            //   * the consumer's parameter is flagged gpuBindable in
+            //     its CustomEffectDefinition,
+            //   * the upstream effect publishes IEngineComputeOutput.
+            //
+            // Discovery uses m_bridgeImplCache directly: D2D's outer
+            // ID2D1Effect's QI does not delegate arbitrary IIDs to the
+            // inner impl, so a raw QI on the cached effect would always
+            // fail for IEngineComputeOutput. The bridge impl pointer
+            // we captured during CreateOrGetEffect (commit 2f69acd)
+            // is the canonical "is this upstream a GPU-output producer"
+            // signal -- the bridge always implements IEngineComputeOutput
+            // by delegation to its internal D3D11ComputeRunner.
+            //
+            // The actual SRV-to-t-slot routing happens in DispatchViaBridge
+            // for D3D11 compute consumers; this branch only bumps a
+            // detection telemetry counter so we can see how many
+            // bindings *could* be routed regardless of consumer kind.
+            if (Performance::IsGpuBindingsEnabled() &&
+                node.customEffect.has_value() &&
+                !binding.wholeArray)
+            {
+                bool propGpuBindable = false;
+                for (const auto& p : node.customEffect->parameters)
+                {
+                    if (p.name == propName) { propGpuBindable = p.gpuBindable; break; }
+                }
+                if (propGpuBindable && !binding.sources.empty() &&
+                    binding.sources[0].has_value())
+                {
+                    uint32_t srcId = binding.sources[0]->sourceNodeId;
+                    auto bridgeIt = m_bridgeImplCache.find(srcId);
+                    if (bridgeIt != m_bridgeImplCache.end() && bridgeIt->second)
+                    {
+                        Performance::IncrementGpuBindingDetection();
+                    }
+                }
+            }
 
             // Whole-array mode.
             if (binding.wholeArray)
@@ -1269,27 +2198,76 @@ namespace ShaderLab::Rendering
             {
                 implIt->second.pixelImpl->SetConstantBufferData(cbData.data(), static_cast<UINT32>(cbData.size()));
 
-                // Update fixed output size for zero-input source effects.
-                if (node.customEffect->inputNames.empty())
+                // Fixed-output sizing.
+                //   - Source effects (no inputs): always size to a Size/PatchSize
+                //     param so D2D doesn't render a 0x0 or full-source-bounds
+                //     output.
+                //   - Effects with inputs: only fix the output size if the
+                //     descriptor *explicitly* declares a `DiagramSize`/`OutputSize`/
+                //     `PatchSize` parameter. Without this, an analysis-style
+                //     viewer like Gamut Coverage / Waveform Monitor (whose pixel
+                //     shader does an O(N) inner loop per output pixel) would
+                //     render at the full source resolution -- billions of
+                //     samples per frame at 4K, hanging the GPU. The shader
+                //     already uses `DiagramSize` to map output coords to its
+                //     visualization domain, so honoring it as the actual
+                //     output size keeps D2D in sync with shader intent.
+                bool hasFixedSizeParam = false;
+                UINT32 outW = 512, outH = 512;
                 {
-                    UINT32 outW = 512, outH = 512;
-                    for (const auto& [key, val] : effectiveProps)
-                    {
-                        if (key.find(L"Size") != std::wstring::npos ||
-                            key.find(L"size") != std::wstring::npos)
+                    auto pickFloat = [&](const std::wstring& key, UINT32* w, UINT32* h) -> bool {
+                        auto it = effectiveProps.find(key);
+                        if (it == effectiveProps.end()) return false;
+                        if (auto* f = std::get_if<float>(&it->second))
                         {
-                            if (auto* f = std::get_if<float>(&val))
-                            { outW = outH = static_cast<UINT32>(*f); break; }
+                            *w = static_cast<UINT32>(*f);
+                            *h = static_cast<UINT32>(*f);
+                            return true;
+                        }
+                        return false;
+                    };
+                    if (pickFloat(L"DiagramSize", &outW, &outH))      hasFixedSizeParam = true;
+                    else if (pickFloat(L"OutputSize", &outW, &outH))  hasFixedSizeParam = true;
+                    else
+                    {
+                        auto patchIt = effectiveProps.find(L"PatchSize");
+                        if (patchIt != effectiveProps.end())
+                        {
+                            if (auto* f = std::get_if<float>(&patchIt->second))
+                            {
+                                outW = static_cast<UINT32>(*f * 6);
+                                outH = static_cast<UINT32>(*f * 4);
+                                hasFixedSizeParam = true;
+                            }
                         }
                     }
-                    auto patchIt = effectiveProps.find(L"PatchSize");
-                    if (patchIt != effectiveProps.end())
+                    if (!hasFixedSizeParam)
                     {
-                        if (auto* f = std::get_if<float>(&patchIt->second))
-                        { outW = static_cast<UINT32>(*f * 6); outH = static_cast<UINT32>(*f * 4); }
+                        // Generic fallback for source effects: any param whose
+                        // name contains "Size" / "size".
+                        if (node.customEffect->inputNames.empty())
+                        {
+                            for (const auto& [key, val] : effectiveProps)
+                            {
+                                if (key.find(L"Size") != std::wstring::npos ||
+                                    key.find(L"size") != std::wstring::npos)
+                                {
+                                    if (auto* f = std::get_if<float>(&val))
+                                    {
+                                        outW = outH = static_cast<UINT32>(*f);
+                                        hasFixedSizeParam = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    implIt->second.pixelImpl->SetFixedOutputSize(outW, outH);
                 }
+                const bool applyFixedSize =
+                    hasFixedSizeParam ||
+                    node.customEffect->inputNames.empty();
+                if (applyFixedSize)
+                    implIt->second.pixelImpl->SetFixedOutputSize(outW, outH);
             }
             else if (node.type == NodeType::ComputeShader && implIt->second.computeImpl)
                 implIt->second.computeImpl->SetConstantBufferData(cbData.data(), static_cast<UINT32>(cbData.size()));
@@ -1516,519 +2494,6 @@ namespace ShaderLab::Rendering
         cpuBitmap->Unmap();
     }
 
-    // -----------------------------------------------------------------------
-    // D3D11 compute dispatch for user-authored shaders
-    // -----------------------------------------------------------------------
-
-    void GraphEvaluator::DispatchUserD3D11Compute(
-        ID2D1DeviceContext5* dc,
-        Graph::EffectNode& node,
-        ID2D1Image* inputImage)
-    {
-        if (!dc || !inputImage) return;
-        if (!node.customEffect.has_value()) return;
-        // NOTE: do NOT early-out when !isCompiled(). D3D11 compute shaders
-        // are compiled lazily by the runner inside this function, so on
-        // the first dispatch isCompiled() is necessarily false; bailing
-        // here would create a chicken-and-egg loop where the bytecode is
-        // never populated. The runner->CompileShader call below sets up
-        // m_shader and the def.compiledBytecode field for next time.
-
-        auto& def = node.customEffect.value();
-        uint32_t fieldCount = 0;
-        for (const auto& f : def.analysisFields)
-            fieldCount += f.pixelCount();
-        if (fieldCount == 0) return;
-
-        // Render input D2D image to a D3D11-accessible bitmap.
-        // Use 96 DPI so bounds are in pixels (not DIPs).
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
-
-        D2D1_RECT_F bounds{};
-        dc->GetImageLocalBounds(inputImage, &bounds);
-        uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
-        uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-        if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return; }
-
-        winrt::com_ptr<ID2D1Bitmap1> gpuTarget;
-        D2D1_BITMAP_PROPERTIES1 gpuProps{};
-        gpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        gpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-        gpuProps.dpiX = 96.0f;
-        gpuProps.dpiY = 96.0f;
-        HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, gpuProps, gpuTarget.put());
-        if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return; }
-
-        winrt::com_ptr<ID2D1Image> prevTarget;
-        dc->GetTarget(prevTarget.put());
-
-        // Render the upstream D2D chain to our GPU bitmap.
-        dc->SetTarget(gpuTarget.get());
-        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-        dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
-        dc->SetTarget(prevTarget.get());
-
-        // Flush D2D command batch so the bitmap is populated before D3D11 reads it.
-        dc->Flush();
-        dc->SetDpi(oldDpiX, oldDpiY);
-
-        // Get D3D11 texture from bitmap.
-        winrt::com_ptr<IDXGISurface> surface;
-        hr = gpuTarget->GetSurface(surface.put());
-        if (FAILED(hr)) return;
-
-        winrt::com_ptr<ID3D11Texture2D> d3dTexture;
-        hr = surface->QueryInterface(d3dTexture.put());
-        if (FAILED(hr)) return;
-
-        // Get or create the per-node runner.
-        auto& runner = m_d3d11RunnerCache[node.id];
-        if (!runner)
-        {
-            runner = std::make_unique<D3D11ComputeRunner>();
-            winrt::com_ptr<ID3D11Device> device;
-            d3dTexture->GetDevice(device.put());
-            runner->Initialize(device.get());
-        }
-
-        // Compile shader if needed (first run or recompile).
-        if (!runner->HasShader())
-        {
-            std::string hlslUtf8 = winrt::to_string(def.hlslSource);
-            for (auto& ch : hlslUtf8) { if (ch == '\r') ch = '\n'; }
-            if (!runner->CompileShader(hlslUtf8))
-            {
-                node.runtimeError = runner->GetCompileError().empty()
-                    ? L"D3D11 compute shader compile failed"
-                    : runner->GetCompileError();
-                return;
-            }
-            // Persist bytecode on the definition so the cbuffer reflection
-            // path below (and the UI's "compiled" indicator) can see it.
-            // Without this, def.compiledBytecode stays empty for D3D11
-            // compute effects and user properties never reach the GPU.
-            def.compiledBytecode = runner->GetCompiledBytecode();
-            node.runtimeError.clear();
-        }
-
-        // Pack cbuffer from node properties (offset 8+, Width/Height auto-injected by runner).
-        std::vector<BYTE> cbData;
-        if (!def.parameters.empty() && !def.compiledBytecode.empty())
-        {
-            // Reflect cbuffer layout to pack properties at correct offsets.
-            winrt::com_ptr<ID3D11ShaderReflection> reflect;
-            hr = D3DReflect(def.compiledBytecode.data(), def.compiledBytecode.size(),
-                IID_ID3D11ShaderReflection, reinterpret_cast<void**>(reflect.put()));
-            if (SUCCEEDED(hr))
-            {
-                auto* cbReflect = reflect->GetConstantBufferByIndex(0);
-                D3D11_SHADER_BUFFER_DESC cbDesc{};
-                if (cbReflect && SUCCEEDED(cbReflect->GetDesc(&cbDesc)))
-                {
-                    // Allocate enough for user params (skip first 8 bytes = Width/Height).
-                    uint32_t userSize = (cbDesc.Size > 8) ? (cbDesc.Size - 8) : 0;
-                    if (userSize > 0)
-                    {
-                        cbData.resize(userSize, 0);
-                        for (UINT v = 0; v < cbDesc.Variables; ++v)
-                        {
-                            auto* var = cbReflect->GetVariableByIndex(v);
-                            D3D11_SHADER_VARIABLE_DESC varDesc{};
-                            if (!var || FAILED(var->GetDesc(&varDesc))) continue;
-                            if (varDesc.StartOffset < 8) continue; // Skip Width/Height
-
-                            std::wstring varName(varDesc.Name, varDesc.Name + strlen(varDesc.Name));
-                            auto propIt = node.properties.find(varName);
-                            if (propIt == node.properties.end()) continue;
-
-                            uint32_t destOff = varDesc.StartOffset - 8;
-                            if (destOff + varDesc.Size > cbData.size()) continue;
-
-                            // Reflect the variable's HLSL scalar type so we
-                            // can convert PropertyValue -> the cbuffer's
-                            // declared representation. Without this a float
-                            // 1.0f written into a `uint` slot lands as the
-                            // bit pattern 0x3F800000 (1065353216), not 1.
-                            D3D11_SHADER_TYPE_DESC typeDesc{};
-                            auto* varType = var->GetType();
-                            D3D_SHADER_VARIABLE_TYPE scalarType = D3D_SVT_FLOAT;
-                            if (varType && SUCCEEDED(varType->GetDesc(&typeDesc)))
-                                scalarType = typeDesc.Type;
-
-                            const auto& pv = propIt->second;
-                            auto pvAsFloat = [&pv]() -> float {
-                                if (auto* f = std::get_if<float>(&pv))    return *f;
-                                if (auto* i = std::get_if<int32_t>(&pv))  return static_cast<float>(*i);
-                                if (auto* u = std::get_if<uint32_t>(&pv)) return static_cast<float>(*u);
-                                if (auto* b = std::get_if<bool>(&pv))     return *b ? 1.0f : 0.0f;
-                                return 0.0f;
-                            };
-
-                            if (scalarType == D3D_SVT_UINT || scalarType == D3D_SVT_BOOL)
-                            {
-                                uint32_t val = static_cast<uint32_t>(pvAsFloat());
-                                memcpy(cbData.data() + destOff, &val, 4);
-                            }
-                            else if (scalarType == D3D_SVT_INT)
-                            {
-                                int32_t val = static_cast<int32_t>(pvAsFloat());
-                                memcpy(cbData.data() + destOff, &val, 4);
-                            }
-                            else
-                            {
-                                float val = pvAsFloat();
-                                memcpy(cbData.data() + destOff, &val, 4);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Dispatch and readback.
-        auto results = runner->Dispatch(d3dTexture.get(), cbData, fieldCount);
-        if (results.empty()) return;
-
-        // Map results to analysis output fields.
-        node.analysisOutput.type = AnalysisOutputType::Typed;
-        node.analysisOutput.fields.clear();
-
-        uint32_t pixelOffset = 0;
-        for (const auto& fd : def.analysisFields)
-        {
-            AnalysisFieldValue fv;
-            fv.name = fd.name;
-            fv.type = fd.type;
-
-            uint32_t pc = fd.pixelCount();
-            bool isArray = AnalysisFieldIsArray(fd.type);
-            uint32_t cc = AnalysisFieldComponentCount(fd.type);
-
-            if (!isArray)
-            {
-                // Single value field.
-                if (pixelOffset * 4 < results.size())
-                {
-                    for (uint32_t c = 0; c < cc && (pixelOffset * 4 + c) < results.size(); ++c)
-                        fv.components[c] = results[pixelOffset * 4 + c];
-                }
-            }
-            else
-            {
-                // Array field.
-                fv.arrayData.resize(fd.arrayLength * cc, 0.0f);
-                for (uint32_t i = 0; i < fd.arrayLength; ++i)
-                {
-                    uint32_t base = (pixelOffset + i) * 4;
-                    for (uint32_t c = 0; c < cc && (base + c) < results.size(); ++c)
-                        fv.arrayData[i * cc + c] = results[base + c];
-                }
-            }
-
-            pixelOffset += pc;
-            node.analysisOutput.fields.push_back(std::move(fv));
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Image-producing D3D11 compute dispatch
-    // -----------------------------------------------------------------------
-
-    void GraphEvaluator::DispatchImageCompute(
-        ID2D1DeviceContext5* dc,
-        EffectNode& node,
-        ID2D1Image* inputImage,
-        ID2D1Bitmap1* preRenderedInput)
-    {
-        if (!dc || !inputImage) { node.runtimeError = L"No DC or input"; return; }
-        if (!node.customEffect.has_value() || node.customEffect->hlslSource.empty()) { node.runtimeError = L"No HLSL"; return; }
-
-        auto& def = node.customEffect.value();
-
-        // Use pre-rendered bitmap if available (rendered during Evaluate
-        // when D2D properties were fresh). Otherwise, render now.
-        winrt::com_ptr<ID2D1Bitmap1> inputBitmap;
-        uint32_t srcW = 0, srcH = 0;
-
-        if (preRenderedInput)
-        {
-            // Use the pre-rendered bitmap directly.
-            inputBitmap.copy_from(preRenderedInput);
-            auto sz = preRenderedInput->GetPixelSize();
-            srcW = sz.width;
-            srcH = sz.height;
-        }
-        else
-        {
-            // Fallback: render upstream D2D chain to FP32 bitmap now.
-            float oldDpiX2, oldDpiY2;
-            dc->GetDpi(&oldDpiX2, &oldDpiY2);
-            dc->SetDpi(96.0f, 96.0f);
-
-            D2D1_RECT_F bounds{};
-            dc->GetImageLocalBounds(inputImage, &bounds);
-            srcW = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
-            srcH = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-            if (srcW == 0 || srcH == 0) { dc->SetDpi(oldDpiX2, oldDpiY2); node.runtimeError = L"Zero input bounds"; return; }
-
-            D2D1_BITMAP_PROPERTIES1 bmpProps{};
-            bmpProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-            bmpProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-            bmpProps.dpiX = 96.0f;
-            bmpProps.dpiY = 96.0f;
-            HRESULT hr2 = dc->CreateBitmap(D2D1::SizeU(srcW, srcH), nullptr, 0, bmpProps, inputBitmap.put());
-            if (FAILED(hr2)) { dc->SetDpi(oldDpiX2, oldDpiY2); node.runtimeError = std::format(L"CreateBitmap input failed 0x{:08X}", (uint32_t)hr2); return; }
-
-            winrt::com_ptr<ID2D1Image> prevTarget2;
-            dc->GetTarget(prevTarget2.put());
-            dc->SetTarget(inputBitmap.get());
-            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-            dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
-            dc->SetTarget(prevTarget2.get());
-            dc->Flush();
-            dc->SetDpi(oldDpiX2, oldDpiY2);
-        }
-
-        if (srcW == 0 || srcH == 0) { node.runtimeError = L"Zero input size"; return; }
-        HRESULT hr = S_OK;
-
-        // Get D3D11 texture from the input bitmap.
-        winrt::com_ptr<IDXGISurface> inputSurface;
-        hr = inputBitmap->GetSurface(inputSurface.put());
-        if (FAILED(hr)) { node.runtimeError = std::format(L"GetSurface failed 0x{:08X}", (uint32_t)hr); return; }
-        winrt::com_ptr<ID3D11Texture2D> inputTex;
-        hr = inputSurface->QueryInterface(inputTex.put());
-        if (FAILED(hr)) { node.runtimeError = L"QI for ID3D11Texture2D failed"; return; }
-
-        winrt::com_ptr<ID3D11Device> device;
-        inputTex->GetDevice(device.put());
-        winrt::com_ptr<ID3D11DeviceContext> d3dCtx;
-        device->GetImmediateContext(d3dCtx.put());
-
-        // Determine output size from DiagramSize or OutputSize property, fallback to source size.
-        uint32_t outW = srcW, outH = srcH;
-        for (const auto& p : def.parameters)
-        {
-            if (p.name == L"DiagramSize" || p.name == L"OutputSize")
-            {
-                auto it = node.properties.find(p.name);
-                if (it != node.properties.end())
-                {
-                    if (auto* f = std::get_if<float>(&it->second))
-                        outW = outH = static_cast<uint32_t>((std::max)(*f, 64.0f));
-                    else if (auto* u = std::get_if<uint32_t>(&it->second))
-                        outW = outH = (std::max)(*u, 64u);
-                }
-                break;
-            }
-        }
-
-        // D3D11 texture with UAV for compute dispatch + SRV so D2D can wrap it.
-        winrt::com_ptr<ID3D11Texture2D> computeTex;
-        {
-            D3D11_TEXTURE2D_DESC td{};
-            td.Width = outW; td.Height = outH; td.MipLevels = 1; td.ArraySize = 1;
-            td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; td.SampleDesc.Count = 1;
-            td.Usage = D3D11_USAGE_DEFAULT;
-            td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-            hr = device->CreateTexture2D(&td, nullptr, computeTex.put());
-            if (FAILED(hr)) { node.runtimeError = std::format(L"CreateTex2D failed 0x{:08X}", (uint32_t)hr); return; }
-        }
-
-        // SRV for input, UAV for compute output.
-        winrt::com_ptr<ID3D11ShaderResourceView> inputSRV;
-        {
-            D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-            sd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-            sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            sd.Texture2D.MipLevels = 1;
-            hr = device->CreateShaderResourceView(inputTex.get(), &sd, inputSRV.put());
-            if (FAILED(hr)) { node.runtimeError = L"CreateSRV failed"; return; }
-        }
-        winrt::com_ptr<ID3D11UnorderedAccessView> outputUAV;
-        {
-            D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-            ud.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-            ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-            hr = device->CreateUnorderedAccessView(computeTex.get(), &ud, outputUAV.put());
-            if (FAILED(hr)) { node.runtimeError = std::format(L"CreateUAV failed 0x{:08X}", (uint32_t)hr); return; }
-        }
-
-        // Compile compute shader (cached by HLSL hash to avoid per-frame recompilation).
-        winrt::com_ptr<ID3D11ComputeShader> shader;
-        winrt::com_ptr<ID3DBlob> blob;
-        {
-            size_t hlslHash = std::hash<std::wstring>{}(def.hlslSource);
-            auto& cached = m_imageComputeCache[node.id];
-            // Check if we have a cached shader for this node with matching HLSL.
-            // Reuse the m_imageComputeCache map entry's com_ptr as a simple existence check.
-            // Store shader+blob in m_imageComputeTexCache-adjacent map (repurposed).
-            static std::unordered_map<uint32_t, std::tuple<size_t,
-                winrt::com_ptr<ID3D11ComputeShader>,
-                winrt::com_ptr<ID3DBlob>>> s_shaderCache;
-
-            // Clear on device change (detected by checking if cached shader's device matches).
-            if (!s_shaderCache.empty() && device)
-            {
-                bool stale = false;
-                for (auto& [id, entry] : s_shaderCache)
-                {
-                    auto& cachedShader = std::get<1>(entry);
-                    if (cachedShader)
-                    {
-                        winrt::com_ptr<ID3D11Device> shaderDevice;
-                        cachedShader->GetDevice(shaderDevice.put());
-                        if (shaderDevice.get() != device.get()) { stale = true; break; }
-                    }
-                }
-                if (stale) s_shaderCache.clear();
-            }
-            auto sit = s_shaderCache.find(node.id);
-            if (sit != s_shaderCache.end() && std::get<0>(sit->second) == hlslHash)
-            {
-                shader = std::get<1>(sit->second);
-                blob = std::get<2>(sit->second);
-            }
-            else
-            {
-                std::string hlsl = winrt::to_string(def.hlslSource);
-                for (auto& ch : hlsl) { if (ch == '\r') ch = '\n'; }
-                winrt::com_ptr<ID3DBlob> errors;
-                hr = D3DCompile(hlsl.c_str(), hlsl.size(), "ImageCompute", nullptr, nullptr,
-                    "main", "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
-                    0, blob.put(), errors.put());
-                if (FAILED(hr))
-                {
-                    if (errors)
-                    {
-                        std::string msg(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize());
-                        node.runtimeError = std::wstring(msg.begin(), msg.end());
-                    }
-                    return;
-                }
-                hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
-                    nullptr, shader.put());
-                if (FAILED(hr)) return;
-                s_shaderCache[node.id] = { hlslHash, shader, blob };
-            }
-        }
-
-        // Pack cbuffer: Width, Height (of source), then user params via reflection.
-        winrt::com_ptr<ID3D11Buffer> cbuffer;
-        {
-            D3D11_BUFFER_DESC cbDesc{};
-            cbDesc.ByteWidth = 256;
-            cbDesc.Usage = D3D11_USAGE_DYNAMIC;
-            cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-            cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-            device->CreateBuffer(&cbDesc, nullptr, cbuffer.put());
-        }
-        if (!cbuffer) return;
-
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        hr = d3dCtx->Map(cbuffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (SUCCEEDED(hr))
-        {
-            memset(mapped.pData, 0, 256);
-            auto* cb = static_cast<BYTE*>(mapped.pData);
-            uint32_t dims[2] = { srcW, srcH };
-            memcpy(cb, dims, 8);
-            // Pack user parameters using reflection on the compiled blob.
-            if (!def.parameters.empty() && blob)
-            {
-                winrt::com_ptr<ID3D11ShaderReflection> reflect;
-                hr = D3DReflect(blob->GetBufferPointer(), blob->GetBufferSize(),
-                    IID_ID3D11ShaderReflection, reinterpret_cast<void**>(reflect.put()));
-                if (SUCCEEDED(hr))
-                {
-                    auto* cbReflect = reflect->GetConstantBufferByIndex(0);
-                    D3D11_SHADER_BUFFER_DESC cbDesc2{};
-                    if (cbReflect && SUCCEEDED(cbReflect->GetDesc(&cbDesc2)))
-                    {
-                        for (UINT v = 0; v < cbDesc2.Variables; ++v)
-                        {
-                            auto* var = cbReflect->GetVariableByIndex(v);
-                            D3D11_SHADER_VARIABLE_DESC varDesc{};
-                            if (SUCCEEDED(var->GetDesc(&varDesc)) && varDesc.StartOffset >= 8)
-                            {
-                                std::wstring name(varDesc.Name, varDesc.Name + strlen(varDesc.Name));
-                                auto it = node.properties.find(name);
-                                if (it != node.properties.end())
-                                {
-                                    // Check reflection type to handle float→uint conversion.
-                                    auto* typeInfo = var->GetType();
-                                    D3D11_SHADER_TYPE_DESC typeDesc{};
-                                    bool isUintVar = false;
-                                    if (typeInfo && SUCCEEDED(typeInfo->GetDesc(&typeDesc)))
-                                        isUintVar = (typeDesc.Type == D3D_SVT_UINT || typeDesc.Type == D3D_SVT_INT);
-
-                                    if (auto* f = std::get_if<float>(&it->second))
-                                    {
-                                        if (isUintVar) {
-                                            uint32_t u = static_cast<uint32_t>(*f);
-                                            memcpy(cb + varDesc.StartOffset, &u, 4);
-                                        } else {
-                                            memcpy(cb + varDesc.StartOffset, f, 4);
-                                        }
-                                    }
-                                    else if (auto* u = std::get_if<uint32_t>(&it->second))
-                                        memcpy(cb + varDesc.StartOffset, u, 4);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            d3dCtx->Unmap(cbuffer.get(), 0);
-        }
-
-        // Clear output texture.
-        float clearColor[4] = { 0, 0, 0, 0 };
-        d3dCtx->ClearUnorderedAccessViewFloat(outputUAV.get(), clearColor);
-
-        // Dispatch compute shader.
-        d3dCtx->CSSetShader(shader.get(), nullptr, 0);
-        ID3D11ShaderResourceView* srvs[] = { inputSRV.get() };
-        d3dCtx->CSSetShaderResources(0, 1, srvs);
-        ID3D11UnorderedAccessView* uavs[] = { outputUAV.get() };
-        d3dCtx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
-        ID3D11Buffer* cbs[] = { cbuffer.get() };
-        d3dCtx->CSSetConstantBuffers(0, 1, cbs);
-
-        // Dispatch as (1,1,1) — single group, 1024 threads.
-        d3dCtx->Dispatch(1, 1, 1);
-
-        // Clear shader state.
-        ID3D11ShaderResourceView* nullSRV[] = { nullptr };
-        d3dCtx->CSSetShaderResources(0, 1, nullSRV);
-        ID3D11UnorderedAccessView* nullUAV[] = { nullptr };
-        d3dCtx->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
-        d3dCtx->CSSetShader(nullptr, nullptr, 0);
-        d3dCtx->Flush();
-
-        // Wrap the compute output texture as a D2D bitmap (read-only for D2D).
-        // D2D can use any texture with SRV bind flag for DrawImage source.
-        winrt::com_ptr<IDXGISurface> computeSurface;
-        hr = computeTex->QueryInterface(computeSurface.put());
-        if (FAILED(hr)) { node.runtimeError = std::format(L"QI DXGI failed 0x{:08X}", (uint32_t)hr); return; }
-
-        winrt::com_ptr<ID2D1Bitmap1> outBitmap;
-        D2D1_BITMAP_PROPERTIES1 bp{};
-        bp.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        bp.bitmapOptions = D2D1_BITMAP_OPTIONS_NONE;
-        bp.dpiX = 96.0f;
-        bp.dpiY = 96.0f;
-        hr = dc->CreateBitmapFromDxgiSurface(computeSurface.get(), bp, outBitmap.put());
-        if (FAILED(hr)) { node.runtimeError = std::format(L"WrapBitmap failed 0x{:08X}", (uint32_t)hr); return; }
-
-        m_imageComputeCache[node.id] = outBitmap;
-        // Also keep the compute texture alive (the D2D bitmap wraps it, doesn't own it).
-        m_imageComputeTexCache[node.id] = computeTex;
-        node.cachedOutput = outBitmap.get();
-        node.runtimeError.clear();
-    }
 
     // -----------------------------------------------------------------------
     // Pre-render upstream D2D chain to FP32 bitmap at 96 DPI
@@ -2073,162 +2538,5 @@ namespace ShaderLab::Rendering
         return bitmap;
     }
 
-    // -----------------------------------------------------------------------
-    // GPU-accelerated image statistics
-    // -----------------------------------------------------------------------
-
-    void GraphEvaluator::ComputeImageStatistics(
-        ID2D1DeviceContext5* dc,
-        EffectNode& node,
-        ID2D1Image* inputImage)
-    {
-        if (!dc || !inputImage) return;
-
-        // Use 96 DPI so GetImageLocalBounds returns pixel coordinates.
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
-
-        // Get input image bounds.
-        D2D1_RECT_F bounds{};
-        dc->GetImageLocalBounds(inputImage, &bounds);
-        uint32_t w = static_cast<uint32_t>((std::min)(bounds.right - bounds.left, 8192.0f));
-        uint32_t h = static_cast<uint32_t>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-        if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return; }
-
-        // Render input to a D2D bitmap backed by a DXGI surface.
-        winrt::com_ptr<ID2D1Bitmap1> gpuTarget;
-        D2D1_BITMAP_PROPERTIES1 gpuProps = {};
-        gpuProps.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-        gpuProps.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-        gpuProps.dpiX = 96.0f;
-        gpuProps.dpiY = 96.0f;
-        HRESULT hr = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, gpuProps, gpuTarget.put());
-        if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return; }
-
-        winrt::com_ptr<ID2D1Image> prevTarget;
-        dc->GetTarget(prevTarget.put());
-
-        // Render the upstream D2D chain to our GPU bitmap.
-        dc->SetTarget(gpuTarget.get());
-        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-        dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
-        dc->SetTarget(prevTarget.get());
-
-        // Flush D2D command batch so the bitmap is populated before D3D11 reads it.
-        // Without this, D2D lazily defers the DrawImage until EndDraw/Flush,
-        // and the D3D11 compute dispatch reads zeros from the texture.
-        dc->Flush();
-        dc->SetDpi(oldDpiX, oldDpiY);
-
-        // Get the underlying D3D11 texture from the D2D bitmap.
-        winrt::com_ptr<IDXGISurface> surface;
-        hr = gpuTarget->GetSurface(surface.put());
-        if (FAILED(hr)) return;
-
-        winrt::com_ptr<ID3D11Texture2D> d3dTexture;
-        hr = surface->QueryInterface(d3dTexture.put());
-        if (FAILED(hr)) return;
-
-        // Initialize GPU reduction if needed.
-        if (!m_gpuReduction.IsInitialized())
-        {
-            winrt::com_ptr<ID3D11Device> device;
-            winrt::com_ptr<ID3D11DeviceContext> d3dCtx;
-            d3dTexture->GetDevice(device.put());
-            device->GetImmediateContext(d3dCtx.put());
-            m_gpuReduction.Initialize(device.get());
-        }
-
-        // Get D3D11 device context.
-        winrt::com_ptr<ID3D11Device> device;
-        d3dTexture->GetDevice(device.put());
-        winrt::com_ptr<ID3D11DeviceContext> d3dCtx;
-        device->GetImmediateContext(d3dCtx.put());
-
-        // Read channel/nonzero settings from properties.
-        uint32_t channel = 0;
-        {
-            auto it = node.properties.find(L"Channel");
-            if (it != node.properties.end())
-                if (auto* f = std::get_if<float>(&it->second)) channel = static_cast<uint32_t>(*f);
-        }
-        bool nonzeroOnly = true;
-        {
-            auto it = node.properties.find(L"NonzeroOnly");
-            if (it != node.properties.end())
-                if (auto* f = std::get_if<float>(&it->second)) nonzeroOnly = *f > 0.5f;
-        }
-
-        // Dispatch GPU reduction.
-        auto stats = m_gpuReduction.Reduce(d3dCtx.get(), d3dTexture.get(), channel, nonzeroOnly);
-
-        float vNonzero = (stats.totalPixels > 0)
-            ? static_cast<float>(stats.nonzeroPixels) / static_cast<float>(stats.totalPixels) : 0.0f;
-
-        // Populate analysis output.
-        node.analysisOutput.type = AnalysisOutputType::Typed;
-        node.analysisOutput.fields.clear();
-
-        auto addField = [&](const std::wstring& name, float value) {
-            AnalysisFieldValue fv;
-            fv.name = name;
-            fv.type = AnalysisFieldType::Float;
-            fv.components[0] = value;
-            node.analysisOutput.fields.push_back(std::move(fv));
-        };
-
-        addField(L"Min", stats.min);
-        addField(L"Max", stats.max);
-        addField(L"Mean", stats.mean);
-        addField(L"Median", stats.median);
-        addField(L"P95", stats.p95);
-        addField(L"Samples", static_cast<float>(stats.samples));
-        addField(L"Nonzero%", vNonzero);
-    }
-
-    // -----------------------------------------------------------------------
-    // Standalone (graph-mutation-free) image statistics for MCP queries.
-    // -----------------------------------------------------------------------
-    std::vector<ImageStats> GraphEvaluator::ComputeStandaloneStats(
-        ID2D1DeviceContext5* dc,
-        ID2D1Image* inputImage,
-        const std::vector<uint32_t>& channels,
-        bool nonzeroOnly)
-    {
-        std::vector<ImageStats> result;
-        if (!dc || !inputImage || channels.empty()) return result;
-
-        // Re-render the upstream chain to a fresh FP32 GPU bitmap.  EndDraw
-        // inside PreRenderInputBitmap flushes the D2D batch, so the surface
-        // is populated before the D3D11 compute pass below.
-        auto fp32 = PreRenderInputBitmap(dc, inputImage);
-        if (!fp32) return result;
-
-        // Pull the underlying D3D11 texture out of the D2D bitmap so we can
-        // hand it to GpuReduction (which speaks raw D3D11).
-        winrt::com_ptr<IDXGISurface> surface;
-        if (FAILED(fp32->GetSurface(surface.put()))) return result;
-        winrt::com_ptr<ID3D11Texture2D> tex;
-        if (FAILED(surface->QueryInterface(tex.put()))) return result;
-
-        winrt::com_ptr<ID3D11Device> device;
-        tex->GetDevice(device.put());
-        winrt::com_ptr<ID3D11DeviceContext> d3dCtx;
-        device->GetImmediateContext(d3dCtx.put());
-
-        if (!m_gpuReduction.IsInitialized())
-            m_gpuReduction.Initialize(device.get());
-
-        result.reserve(channels.size());
-        for (uint32_t ch : channels)
-        {
-            // Defensive: GpuReduction channel codes are 0=Y,1=R,2=G,3=B,4=A.
-            // Anything outside that range falls back to luminance.
-            uint32_t safe = (ch <= 4) ? ch : 0;
-            result.push_back(m_gpuReduction.Reduce(d3dCtx.get(), tex.get(), safe, nonzeroOnly));
-        }
-        return result;
-    }
 }
 

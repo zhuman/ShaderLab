@@ -91,3 +91,38 @@ jobs:
             ${{ env.Platform }}/${{ env.Configuration }}/**/*.tlog
           if-no-files-found: ignore
           retention-days: 7
+
+  bootstrap-smoke:
+    name: Bootstrap.ps1 smoke (clean clone)
+    runs-on: windows-latest
+    # Catches onboarding-cliff regressions: a fresh clone must build via
+    # the documented one-command setup. Only runs Debug|x64 -- the full
+    # matrix is build-and-test above.
+    steps:
+      - name: Checkout (clean)
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Run Bootstrap.ps1 (cert + ExprTk + restore + smoke build)
+        shell: pwsh
+        run: .\Bootstrap.ps1 -Build -Configuration Debug -Platform x64
+
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          $exe = "$env:GITHUB_WORKSPACE\x64\Debug\ShaderLabTests\ShaderLabTests.exe"
+          & $exe --adapter warp
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "ShaderLabTests reported $LASTEXITCODE failure(s)"
+            exit $LASTEXITCODE
+          }
+
+      - name: Run headless smoke
+        shell: pwsh
+        run: .\Tests\RunHeadlessSmoke.ps1 -Configuration Debug -Platform x64
+

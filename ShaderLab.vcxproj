@@ -135,7 +135,6 @@
     <ClInclude Include="Effects\WindowsGraphicsCaptureSourceProvider.h" />
     <ClInclude Include="Version.h" />
     <ClInclude Include="Effects\SourceNodeFactory.h" />
-    <ClInclude Include="ShaderLab\McpHttpServer.h" />
     <ClInclude Include="Graph\EffectEdge.h" />
     <ClInclude Include="Graph\EffectGraph.h" />
     <ClInclude Include="Graph\EffectNode.h" />
@@ -155,13 +154,11 @@
     <ClInclude Include="Rendering\DisplayMonitor.h" />
     <ClInclude Include="Rendering\DisplayProfile.h" />
     <ClInclude Include="Rendering\GraphEvaluator.h" />
-    <ClInclude Include="Rendering\GpuReduction.h" />
     <ClInclude Include="Rendering\D3D11ComputeRunner.h" />
-    <ClInclude Include="Effects\StatisticsEffect.h" />
+    <ClInclude Include="Rendering\D3D11ComputeRunner.h" />
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
     <ClInclude Include="Rendering\RenderEngine.h" />
-    <ClInclude Include="Rendering\ToneMapper.h" />
     <ClInclude Include="Rendering\FalseColorOverlay.h" />
   </ItemGroup>
   <ItemGroup>
@@ -176,9 +173,6 @@
     <ClCompile Include="Controls\PixelInspectorController.cpp" />
     <ClCompile Include="Controls\PixelTraceController.cpp" />
     <ClCompile Include="Controls\ShaderEditorController.cpp" />
-    <ClCompile Include="ShaderLab\McpHttpServer.cpp">
-      <PrecompiledHeader>NotUsing</PrecompiledHeader>
-    </ClCompile>
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
@@ -186,6 +180,15 @@
       <DependentUpon>App.xaml</DependentUpon>
     </ClCompile>
     <ClCompile Include="MainWindow.xaml.cpp">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="MainWindow.WorkingSpace.cpp">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="MainWindow.GraphFileIo.cpp">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </ClCompile>
+    <ClCompile Include="MainWindow.RenderTick.cpp">
       <DependentUpon>MainWindow.xaml</DependentUpon>
     </ClCompile>
     <ClCompile Include="MainWindow.McpRoutes.cpp" />

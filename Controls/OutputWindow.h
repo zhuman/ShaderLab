@@ -2,7 +2,6 @@
 
 #include "pch.h"
 #include "../Rendering/PipelineFormat.h"
-#include "../Rendering/ToneMapper.h"
 
 namespace ShaderLab::Controls
 {

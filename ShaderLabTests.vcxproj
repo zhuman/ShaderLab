@@ -97,12 +97,20 @@
   <ItemGroup>
     <ClInclude Include="EngineExport.h" />
     <ClInclude Include="pch_engine.h" />
+    <ClInclude Include="Tests\TestCommon.h" />
+    <ClInclude Include="Tests\ShaderTestBench.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch_engine.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Tests\TestRunner.cpp" />
+    <ClCompile Include="Tests\ShaderTestBench.cpp" />
+    <ClCompile Include="Tests\Math\TransferFunctionTests.cpp" />
+    <ClCompile Include="Tests\Math\ColorMatrixTests.cpp" />
+    <ClCompile Include="Tests\Math\MobiusReinhardTests.cpp" />
+    <ClCompile Include="Tests\Math\DeltaETests.cpp" />
+    <ClCompile Include="Tests\Math\GamutTests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="ShaderLabEngine.vcxproj">

@@ -9,6 +9,7 @@
   <Folder Name="/Solution Items/">
     <File Path="nuget.config" />
   </Folder>
+  <Project Path="ShaderLabHeadless.vcxproj" Id="d2e3f4a5-2233-4c44-ad55-667788990011" />
   <Project Path="ShaderLab.vcxproj" Id="a1b2c3d4-e5f6-7890-abcd-ef1234567890">
     <Deploy Solution="*|x64" />
     <Deploy Solution="*|ARM64" />

@@ -87,6 +87,22 @@ namespace ShaderLab::Effects
 
     SHADERLAB_API void RegisterEngineD2DEffects(ID2D1Factory1* factory);
 
+    // Configure the on-disk bytecode cache for this process. Pass an
+    // empty `rootPath` to disable disk persistence (tests, headless
+    // ad-hoc runs). When non-empty, the directory is created if
+    // missing, and a background thread reaps entries older than
+    // `staleThresholdSec` (default 90 days) so the cache doesn't
+    // grow without bound. Pass 0 for staleThresholdSec to skip the
+    // background reap (the user can still trigger it manually via
+    // the status-bar broom button).
+    //
+    // Recommended: pass `%LOCALAPPDATA%\ShaderLab\bytecode\`. The
+    // engine does NOT pick a default automatically -- the host owns
+    // the path policy so headless/test runs can opt out cleanly.
+    SHADERLAB_API void ConfigureBytecodeCache(
+        std::wstring rootPath,
+        uint64_t staleThresholdSec = 90ull * 24 * 60 * 60);
+
     // Shared HLSL color math functions (prepended to all ShaderLab shaders).
-    const std::string& GetColorMathHLSL();
+    SHADERLAB_API const std::string& GetColorMathHLSL();
 }

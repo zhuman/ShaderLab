@@ -552,7 +552,6 @@ namespace ShaderLab::Controls
 
         for (uint32_t nodeId : m_selection.selectedNodeIds)
         {
-            // RemoveNode() already protects the last Output node.
             m_graph->RemoveNode(nodeId);
             m_visuals.erase(nodeId);
         }
@@ -648,9 +647,6 @@ namespace ShaderLab::Controls
         // analysis fields as outputs. Build name (for binding lookup) and label (for display).
         for (const auto& [key, val] : node.properties)
         {
-            // Skip hidden properties (internal cbuffer plumbing).
-            if (key.size() > 7 && key.ends_with(L"_hidden"))
-                continue;
             // For nodes with a customEffect, only show input pins for properties
             // that correspond to a declared parameter. Properties that exist
             // solely as host-driven bootstrap values (e.g. Working Space, fed

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../../EngineExport.h"
 #include <string>
 #include <vector>
 #include <functional>
@@ -16,7 +17,7 @@ namespace ShaderLab
     // Lightweight HTTP server using raw Winsock2 TCP sockets.
     // Runs on a background thread; handlers must dispatch UI-thread work
     // via DispatcherQueue themselves.
-    class McpHttpServer
+    class SHADERLAB_API McpHttpServer
     {
     public:
         struct Response

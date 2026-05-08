@@ -112,6 +112,8 @@
     <ClInclude Include="EngineExport.h" />
     <ClInclude Include="Version.h" />
     <ClInclude Include="pch_engine.h" />
+    <ClInclude Include="Engine\Mcp\McpHttpServer.h" />
+    <ClInclude Include="Engine\Mcp\EngineMcpRoutes.h" />
     <ClInclude Include="Graph\EffectEdge.h" />
     <ClInclude Include="Graph\EffectGraph.h" />
     <ClInclude Include="Graph\EffectNode.h" />
@@ -123,12 +125,18 @@
     <ClInclude Include="Rendering\DisplayProfile.h" />
     <ClInclude Include="Rendering\EffectGraphFile.h" />
     <ClInclude Include="Rendering\FalseColorOverlay.h" />
-    <ClInclude Include="Rendering\GpuReduction.h" />
     <ClInclude Include="Rendering\GraphEvaluator.h" />
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\MathExpression.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
-    <ClInclude Include="Rendering\ToneMapper.h" />
+    <ClInclude Include="Rendering\CaptureNode.h" />
+    <ClInclude Include="Effects\ShaderLabParamsHlsl.h" />
+    <ClInclude Include="Effects\IEngineComputeOutput.h" />
+    <ClInclude Include="Rendering\WorkingSpaceSync.h" />
+    <ClInclude Include="Rendering\PixelReadback.h" />
+    <ClInclude Include="Effects\Performance.h" />
+    <ClInclude Include="Effects\BytecodeCache.h" />
+    <ClInclude Include="Effects\CustomComputeBridgeEffect.h" />
     <ClInclude Include="Effects\CustomComputeShaderEffect.h" />
     <ClInclude Include="Effects\CustomPixelShaderEffect.h" />
     <ClInclude Include="Effects\EffectRegistry.h" />
@@ -139,37 +147,46 @@
     <ClInclude Include="Effects\DxgiDuplicationSourceProvider.h" />
     <ClInclude Include="Effects\WindowsGraphicsCaptureSourceProvider.h" />
     <ClInclude Include="Effects\SourceNodeFactory.h" />
-    <ClInclude Include="Effects\StatisticsEffect.h" />
     <ClInclude Include="Effects\VideoSourceProvider.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch_engine.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="EngineExport.cpp" />
     <ClCompile Include="Graph\EffectGraph.cpp" />
     <ClCompile Include="Rendering\D3D11ComputeRunner.cpp" />
     <ClCompile Include="Rendering\DisplayMonitor.cpp" />
     <ClCompile Include="Rendering\FalseColorOverlay.cpp" />
-    <ClCompile Include="Rendering\GpuReduction.cpp" />
     <ClCompile Include="Rendering\GraphEvaluator.cpp" />
     <ClCompile Include="Rendering\IccProfileParser.cpp" />
+    <ClCompile Include="Rendering\CaptureNode.cpp" />
+    <ClCompile Include="Rendering\WorkingSpaceSync.cpp" />
+    <ClCompile Include="Rendering\PixelReadback.cpp" />
     <ClCompile Include="Rendering\EffectGraphFile.cpp" />
     <ClCompile Include="Rendering\MathExpression.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <DisableSpecificWarnings>4127;4244;4267;4456;4457;4458;4459;4505;4701;4702;4715;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
-    <ClCompile Include="Rendering\ToneMapper.cpp" />
+    <ClCompile Include="Effects\ColorMath.cpp" />
+    <ClCompile Include="Effects\Performance.cpp" />
+    <ClCompile Include="Effects\BytecodeCache.cpp" />
+    <ClCompile Include="Effects\CustomComputeBridgeEffect.cpp" />
     <ClCompile Include="Effects\CustomComputeShaderEffect.cpp" />
     <ClCompile Include="Effects\CustomPixelShaderEffect.cpp" />
     <ClCompile Include="Effects\EffectRegistry.cpp" />
     <ClCompile Include="Effects\ImageLoader.cpp" />
     <ClCompile Include="Effects\ShaderCompiler.cpp" />
+    <ClCompile Include="Effects\ShaderLabParamsHlsl.cpp" />
     <ClCompile Include="Effects\ShaderLabEffects.cpp" />
     <ClCompile Include="Effects\DxgiDuplicationSourceProvider.cpp" />
     <ClCompile Include="Effects\WindowsGraphicsCaptureSourceProvider.cpp" />
     <ClCompile Include="Effects\SourceNodeFactory.cpp" />
-    <ClCompile Include="Effects\StatisticsEffect.cpp" />
     <ClCompile Include="Effects\VideoSourceProvider.cpp" />
+    <ClCompile Include="Engine\Mcp\McpHttpServer.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="Engine\Mcp\EngineMcpRoutes.cpp" />
     <ClCompile Include="third_party\miniz\miniz.c">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <CompileAs>CompileAsC</CompileAs>

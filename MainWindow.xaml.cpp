@@ -7,11 +7,15 @@
 #include "Rendering/PipelineFormat.h"
 #include "Rendering/IccProfileParser.h"
 #include "Rendering/EffectGraphFile.h"
+#include "Rendering/PixelReadback.h"
 #include "Effects/ShaderLabEffects.h"
-#include "Effects/StatisticsEffect.h"
 #include "Effects/DxgiDuplicationSourceProvider.h"
+#include "Effects/Performance.h"
 #include "Version.h"
+#include "EngineExport.h"
 #include <microsoft.ui.xaml.media.dxinterop.h>
+#include <shlobj.h>
+#include <KnownFolders.h>
 
 using namespace winrt;
 using namespace Microsoft::UI::Xaml;
@@ -21,6 +25,20 @@ namespace winrt::ShaderLab::implementation
     MainWindow::MainWindow()
     {
         InitializeComponent();
+
+        // Engine ABI compatibility check. Mismatch means the loaded
+        // ShaderLabEngine.dll is from a different build than the headers
+        // we compiled against -- abort early with a friendly message
+        // instead of failing later in an obscure way.
+        if (::ShaderLab_GetAbiVersion() != SHADERLAB_ENGINE_ABI_VERSION)
+        {
+            wchar_t msg[256];
+            swprintf_s(msg, L"ShaderLab engine ABI mismatch (header %u, DLL %u). Rebuild and redeploy.",
+                static_cast<unsigned>(SHADERLAB_ENGINE_ABI_VERSION),
+                static_cast<unsigned>(::ShaderLab_GetAbiVersion()));
+            ::MessageBoxW(nullptr, msg, L"ShaderLab", MB_OK | MB_ICONERROR);
+            ::ExitProcess(1);
+        }
 
         Title(std::wstring(L"ShaderLab v") + ::ShaderLab::VersionString + L" \u2014 HDR Shader Effect Development");
         // After Title() we'll refresh from RefreshTitleBar() once a graph
@@ -421,6 +439,15 @@ namespace winrt::ShaderLab::implementation
         // Create D3D11/D2D1 device stack and swap chain on the PreviewPanel.
         m_renderEngine.Initialize(m_hwnd, PreviewPanel(), format, m_devicePref);
 
+        // Phase 8c: enable skip-unneeded-CPU-readback. Every frame the
+        // RenderTick installs `{m_selectedNodeId}` as the CPU-analysis
+        // interest set, so the selected node's Properties panel stays
+        // live while every other compute analysis dispatch's Map() is
+        // skipped when its consumers are entirely GPU-routed.
+        // MCP /analysis/{id} reads temporarily disable the flag so they
+        // always return fresh values regardless of selection.
+        ::ShaderLab::Performance::SetSkipUnneededCpuReadbackEnabled(true);
+
         // Now that we have a DXGI factory, register adapter-change monitoring.
         if (m_renderEngine.DXGIFactory())
         {
@@ -461,6 +488,17 @@ namespace winrt::ShaderLab::implementation
 
         ::ShaderLab::Effects::RegisterEngineD2DEffects(factory1.get());
         OutputDebugStringW(L"[CustomFX] Registered engine D2D effects\n");
+
+        // Phase 8: enable on-disk bytecode cache under %LOCALAPPDATA%.
+        // Background-reap entries older than 90 days on engine init.
+        wchar_t* localAppData = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localAppData)) && localAppData)
+        {
+            std::wstring cacheRoot = std::wstring(localAppData) + L"\\ShaderLab\\bytecode";
+            ::CoTaskMemFree(localAppData);
+            ::ShaderLab::Effects::ConfigureBytecodeCache(cacheRoot);
+            OutputDebugStringW((L"[CustomFX] BytecodeCache root: " + cacheRoot + L"\n").c_str());
+        }
 
         m_customEffectsRegistered = true;
     }
@@ -1124,1041 +1162,18 @@ namespace winrt::ShaderLab::implementation
     }
 
     // -----------------------------------------------------------------------
-    // Display profile selection
+    // Display profile selection -- methods moved to MainWindow.WorkingSpace.cpp
+    // (Phase 4 split). PopulateDisplayProfileSelector / ApplyDisplayProfile /
+    // RevertToLiveDisplay / UpdateWorkingSpaceNodes /
+    // OnDisplayProfileSelectionChanged / LoadIccProfileAsync are members of
+    // the same class -- see MainWindow.xaml.h.
     // -----------------------------------------------------------------------
 
-    void MainWindow::PopulateDisplayProfileSelector()
-    {
-        m_suppressProfileEvent = true;
-        auto selector = DisplayProfileSelector();
-        selector.Items().Clear();
-
-        // "Current Monitor" item.
-        auto currentItem = winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem();
-        currentItem.Content(winrt::box_value(L"Current Monitor"));
-        currentItem.Tag(winrt::box_value(L"current"));
-        selector.Items().Append(currentItem);
-
-        // Preset items.
-        m_displayPresets = ::ShaderLab::Rendering::AllPresets();
-        for (size_t i = 0; i < m_displayPresets.size(); ++i)
-        {
-            auto item = winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem();
-            item.Content(winrt::box_value(winrt::hstring(m_displayPresets[i].profileName)));
-            item.Tag(winrt::box_value(L"preset:" + std::to_wstring(i)));
-            selector.Items().Append(item);
-        }
-
-        // "Load ICC Profile..." action item.
-        auto loadItem = winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem();
-        loadItem.Content(winrt::box_value(L"Load ICC Profile\u2026"));
-        loadItem.Tag(winrt::box_value(L"load"));
-        selector.Items().Append(loadItem);
-
-        selector.SelectedIndex(0);
-        m_committedProfileIndex = 0;
-        m_suppressProfileEvent = false;
-    }
-
-    void MainWindow::ApplyDisplayProfile(const ::ShaderLab::Rendering::DisplayProfile& profile)
-    {
-        m_displayMonitor.SetSimulatedProfile(profile);
-        m_graph.MarkAllDirty();
-        m_forceRender = true;
-        UpdateWorkingSpaceNodes();
-        UpdateStatusBar();
-    }
-
-    void MainWindow::RevertToLiveDisplay()
-    {
-        m_displayMonitor.ClearSimulatedProfile();
-        m_graph.MarkAllDirty();
-        m_forceRender = true;
-        UpdateWorkingSpaceNodes();
-        UpdateStatusBar();
-    }
-
-    void MainWindow::UpdateWorkingSpaceNodes()
-    {
-        // Walk every node in the graph and, for each "Working Space"
-        // parameter node, write the 14 fields of the active profile into
-        // the node's properties keyed by analysis-field name. Marks the
-        // node dirty only when at least one field actually changed so the
-        // render loop doesn't re-evaluate every tick when the profile is
-        // stable.
-        using namespace ::ShaderLab::Graph;
-        using winrt::Windows::Foundation::Numerics::float2;
-
-        auto profile = m_displayMonitor.ActiveProfile();
-        const auto& caps = profile.caps;
-        const bool isSim = m_displayMonitor.IsSimulated();
-
-        struct ScalarField { const wchar_t* name; float value; };
-        const ScalarField scalars[] = {
-            { L"ActiveColorMode",  static_cast<float>(caps.activeColorMode) },
-            { L"HdrSupported",     caps.hdrSupported    ? 1.0f : 0.0f },
-            { L"HdrUserEnabled",   caps.hdrUserEnabled  ? 1.0f : 0.0f },
-            { L"WcgSupported",     caps.wcgSupported    ? 1.0f : 0.0f },
-            { L"WcgUserEnabled",   caps.wcgUserEnabled  ? 1.0f : 0.0f },
-            { L"IsSimulated",      isSim ? 1.0f : 0.0f },
-            { L"SdrWhiteNits",     caps.sdrWhiteLevelNits },
-            { L"PeakNits",         caps.maxLuminanceNits },
-            { L"MinNits",          caps.minLuminanceNits },
-            { L"MaxFullFrameNits", caps.maxFullFrameLuminanceNits },
-        };
-
-        struct VectorField { const wchar_t* name; float2 value; };
-        const VectorField vectors[] = {
-            { L"RedPrimary",   float2{ profile.primaryRed.x,   profile.primaryRed.y   } },
-            { L"GreenPrimary", float2{ profile.primaryGreen.x, profile.primaryGreen.y } },
-            { L"BluePrimary",  float2{ profile.primaryBlue.x,  profile.primaryBlue.y  } },
-            { L"WhitePoint",   float2{ profile.whitePoint.x,   profile.whitePoint.y   } },
-        };
-
-        bool anyChanged = false;
-        for (auto& node : const_cast<std::vector<EffectNode>&>(m_graph.Nodes()))
-        {
-            if (!node.customEffect.has_value()) continue;
-            if (node.customEffect->shaderLabEffectId != L"Working Space") continue;
-
-            bool nodeChanged = false;
-
-            for (const auto& f : scalars)
-            {
-                auto it = node.properties.find(f.name);
-                if (it == node.properties.end())
-                {
-                    node.properties[f.name] = PropertyValue{ f.value };
-                    nodeChanged = true;
-                    continue;
-                }
-                if (auto* cur = std::get_if<float>(&it->second))
-                {
-                    if (*cur != f.value)
-                    {
-                        *cur = f.value;
-                        nodeChanged = true;
-                    }
-                }
-                else
-                {
-                    it->second = PropertyValue{ f.value };
-                    nodeChanged = true;
-                }
-            }
-
-            for (const auto& f : vectors)
-            {
-                auto it = node.properties.find(f.name);
-                if (it == node.properties.end())
-                {
-                    node.properties[f.name] = PropertyValue{ f.value };
-                    nodeChanged = true;
-                    continue;
-                }
-                if (auto* cur = std::get_if<float2>(&it->second))
-                {
-                    if (cur->x != f.value.x || cur->y != f.value.y)
-                    {
-                        *cur = f.value;
-                        nodeChanged = true;
-                    }
-                }
-                else
-                {
-                    it->second = PropertyValue{ f.value };
-                    nodeChanged = true;
-                }
-            }
-
-            if (nodeChanged)
-            {
-                node.dirty = true;
-                anyChanged = true;
-            }
-        }
-
-        if (anyChanged)
-            m_forceRender = true;
-    }
-
-    void MainWindow::OnDisplayProfileSelectionChanged(
-        winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::Controls::SelectionChangedEventArgs const& /*args*/)
-    {
-        if (m_suppressProfileEvent) return;
-
-        auto selector = DisplayProfileSelector();
-        auto selected = selector.SelectedItem();
-        if (!selected) return;
-
-        auto item = selected.as<winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem>();
-        auto tag = winrt::unbox_value<winrt::hstring>(item.Tag());
-
-        if (tag == L"current")
-        {
-            RevertToLiveDisplay();
-            m_committedProfileIndex = selector.SelectedIndex();
-        }
-        else if (tag.size() > 7 && tag.c_str()[0] == L'p') // "preset:N"
-        {
-            auto indexStr = std::wstring(tag.c_str() + 7);
-            size_t presetIdx = static_cast<size_t>(std::stoul(indexStr));
-            if (presetIdx < m_displayPresets.size())
-            {
-                ApplyDisplayProfile(m_displayPresets[presetIdx]);
-                m_committedProfileIndex = selector.SelectedIndex();
-            }
-        }
-        else if (tag == L"icc")
-        {
-            if (m_loadedIccProfile.has_value())
-            {
-                ApplyDisplayProfile(m_loadedIccProfile.value());
-                m_committedProfileIndex = selector.SelectedIndex();
-            }
-        }
-        else if (tag == L"load")
-        {
-            LoadIccProfileAsync();
-        }
-    }
-
-    winrt::fire_and_forget MainWindow::LoadIccProfileAsync()
-    {
-        auto strong = get_strong();
-
-        winrt::Windows::Storage::Pickers::FileOpenPicker picker;
-        picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
-        picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::DocumentsLibrary);
-        picker.FileTypeFilter().Append(L".icc");
-        picker.FileTypeFilter().Append(L".icm");
-
-        auto file = co_await picker.PickSingleFileAsync();
-
-        if (!file)
-        {
-            // User cancelled — revert to the previously committed selection.
-            m_suppressProfileEvent = true;
-            DisplayProfileSelector().SelectedIndex(m_committedProfileIndex);
-            m_suppressProfileEvent = false;
-            co_return;
-        }
-
-        auto path = std::wstring(file.Path().c_str());
-        auto parsed = ::ShaderLab::Rendering::IccProfileParser::LoadFromFile(path);
-
-        if (!parsed.has_value() || !parsed->valid)
-        {
-            // Parse failed — revert selection and show error in status bar.
-            m_suppressProfileEvent = true;
-            DisplayProfileSelector().SelectedIndex(m_committedProfileIndex);
-            m_suppressProfileEvent = false;
-            PipelineFormatText().Text(L"ICC Error: Failed to parse profile");
-            co_return;
-        }
-
-        auto profile = ::ShaderLab::Rendering::DisplayProfileFromIcc(parsed.value());
-        m_loadedIccProfile = profile;
-
-        // Insert or update the ICC item (just before the "Load ICC..." sentinel).
-        m_suppressProfileEvent = true;
-        auto selector = DisplayProfileSelector();
-        uint32_t loadIdx = selector.Items().Size() - 1;
-
-        // Remove any previous ICC item.
-        if (loadIdx > 0)
-        {
-            auto prevItem = selector.Items().GetAt(loadIdx - 1).as<winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem>();
-            auto prevTag = winrt::unbox_value<winrt::hstring>(prevItem.Tag());
-            if (prevTag == L"icc")
-            {
-                selector.Items().RemoveAt(loadIdx - 1);
-                loadIdx--;
-            }
-        }
-
-        // Insert the new ICC item before the "Load..." sentinel.
-        auto iccItem = winrt::Microsoft::UI::Xaml::Controls::ComboBoxItem();
-        iccItem.Content(winrt::box_value(winrt::hstring(profile.profileName)));
-        iccItem.Tag(winrt::box_value(L"icc"));
-        selector.Items().InsertAt(loadIdx, iccItem);
-
-        // Select the newly inserted item.
-        selector.SelectedIndex(static_cast<int32_t>(loadIdx));
-        m_committedProfileIndex = static_cast<int32_t>(loadIdx);
-        m_suppressProfileEvent = false;
-
-        ApplyDisplayProfile(profile);
-    }
-
     // -----------------------------------------------------------------------
-    // Graph save/load
+    // Graph save/load + embedded-media archive + heartbeat / stale-temp-dir
+    // reaper -- methods moved to MainWindow.GraphFileIo.cpp (Phase 4 split).
+    // The methods are members of the same class -- see MainWindow.xaml.h.
     // -----------------------------------------------------------------------
-
-    void MainWindow::OnSaveGraphClicked(
-        winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::RoutedEventArgs const& /*args*/)
-    {
-        SaveGraphAsync();
-    }
-
-    void MainWindow::OnLoadGraphClicked(
-        winrt::Windows::Foundation::IInspectable const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::RoutedEventArgs const& /*args*/)
-    {
-        LoadGraphAsync();
-    }
-
-    void MainWindow::OnSaveAccelerator(
-        winrt::Microsoft::UI::Xaml::Input::KeyboardAccelerator const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::Input::KeyboardAcceleratorInvokedEventArgs const& args)
-    {
-        args.Handled(true);
-        SaveGraphAsync();
-    }
-
-    void MainWindow::OnSaveAsAccelerator(
-        winrt::Microsoft::UI::Xaml::Input::KeyboardAccelerator const& /*sender*/,
-        winrt::Microsoft::UI::Xaml::Input::KeyboardAcceleratorInvokedEventArgs const& args)
-    {
-        args.Handled(true);
-        SaveGraphAsAsync();
-    }
-
-    void MainWindow::MarkUnsaved()
-    {
-        if (m_unsavedChanges) return;
-        m_unsavedChanges = true;
-        RefreshTitleBar();
-    }
-
-    void MainWindow::RefreshTitleBar()
-    {
-        // Title format: "<filename>[*] - ShaderLab <version> (effects lib vN)".
-        // The unsaved star is the standard editor convention; the filename
-        // is derived from m_currentFilePath if known, else "Untitled". The
-        // effect-library version moved here from the status bar to free up
-        // room for the FPS readout on the right.
-        std::wstring base = m_currentFilePath.empty() ? std::wstring(L"Untitled") :
-            std::filesystem::path(m_currentFilePath).filename().wstring();
-        auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
-        std::wstring title = base + (m_unsavedChanges ? L"*" : L"")
-            + L" - ShaderLab " + ::ShaderLab::VersionString
-            + L" (effects lib v" + std::to_wstring(lib.LibraryVersion()) + L")";
-        try { Title(winrt::hstring(title)); } catch (...) {}
-    }
-
-    bool MainWindow::SaveGraphToCurrentPath()
-    {
-        if (m_currentFilePath.empty()) return false;
-
-        // Synchronous flavor: used by the close-confirmation dialog
-        // which is itself async, so we don't add a second progress
-        // dialog. Also used as the bottom-half of the async save.
-        try
-        {
-            // Collect every source node that points at a real file
-            // on disk (skip media:// tokens carried over from a
-            // previous load when m_embedMedia is off -- those are
-            // already inside someone else's archive). Generate a
-            // unique zip entry name for each file (keep the basename
-            // when possible; suffix with -2 / -3 on collision).
-            std::vector<::ShaderLab::Rendering::EffectGraphFile::MediaEntry> media;
-            std::map<uint32_t, std::wstring> rewriteToToken; // nodeId -> media://name
-            if (m_embedMedia)
-            {
-                std::set<std::wstring> usedNames;
-                for (const auto& n : m_graph.Nodes())
-                {
-                    if (n.type != ::ShaderLab::Graph::NodeType::Source) continue;
-                    if (!n.shaderPath.has_value()) continue;
-                    const std::wstring& p = n.shaderPath.value();
-                    if (p.empty()) continue;
-                    if (p.starts_with(L"media://")) continue; // already a token
-
-                    // Verify the file is actually present on disk; skip
-                    // missing files silently rather than failing the whole save.
-                    if (!std::filesystem::exists(p)) continue;
-
-                    std::wstring base = std::filesystem::path(p).filename().wstring();
-                    std::wstring name = base;
-                    int suffix = 2;
-                    while (usedNames.count(name))
-                    {
-                        auto stem = std::filesystem::path(base).stem().wstring();
-                        auto ext = std::filesystem::path(base).extension().wstring();
-                        name = stem + L"-" + std::to_wstring(suffix++) + ext;
-                    }
-                    usedNames.insert(name);
-
-                    ::ShaderLab::Rendering::EffectGraphFile::MediaEntry me;
-                    me.zipEntryName = L"media/" + name;
-                    me.sourcePath = p;
-                    media.push_back(std::move(me));
-                    rewriteToToken[n.id] = L"media://" + name;
-                }
-            }
-
-            // Serialize a *copy* of the graph with the rewritten paths
-            // so the live in-memory graph keeps its filesystem refs --
-            // re-saving from temp media after a load just round-trips
-            // the same temp filesystem path through the same logic.
-            std::wstring jsonText;
-            if (rewriteToToken.empty())
-            {
-                jsonText = std::wstring(m_graph.ToJson());
-            }
-            else
-            {
-                ::ShaderLab::Graph::EffectGraph clone = m_graph;
-                for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(clone.Nodes()))
-                {
-                    auto it = rewriteToToken.find(n.id);
-                    if (it == rewriteToToken.end()) continue;
-                    n.shaderPath = it->second;
-                    auto pit = n.properties.find(L"shaderPath");
-                    if (pit != n.properties.end())
-                        pit->second = it->second;
-                }
-                jsonText = std::wstring(clone.ToJson());
-            }
-
-            const bool ok = ::ShaderLab::Rendering::EffectGraphFile::Save(
-                m_currentFilePath, jsonText, media);
-            if (ok)
-            {
-                m_unsavedChanges = false;
-                RefreshTitleBar();
-                PipelineFormatText().Text(
-                    L"Graph saved: " +
-                    winrt::hstring(std::filesystem::path(m_currentFilePath).filename().wstring()));
-            }
-            else
-            {
-                PipelineFormatText().Text(L"Error: Failed to save graph");
-            }
-            return ok;
-        }
-        catch (...)
-        {
-            PipelineFormatText().Text(L"Error: Failed to save graph");
-            return false;
-        }
-    }
-
-    winrt::Windows::Foundation::IAsyncAction MainWindow::SaveGraphToCurrentPathAsync()
-    {
-        // Trivial wrapper kept for symmetry with SaveGraphAsAsync.
-        // The synchronous save runs on the calling thread; for the
-        // close-confirmation flow that's the UI thread, which is
-        // acceptable because the user is staring at a modal dialog.
-        auto strong = get_strong();
-        SaveGraphToCurrentPath();
-        co_return;
-    }
-
-    winrt::Windows::Foundation::IAsyncAction MainWindow::RunSaveWithProgressAsync()
-    {
-        auto strong = get_strong();
-        if (m_currentFilePath.empty()) co_return;
-
-        // Build a lightweight progress dialog. The save runs on the UI
-        // thread (it's normally a few hundred ms even with embedded
-        // media), and the progress callback updates the dialog text
-        // synchronously between zip entries. Doing the save on a
-        // background thread tripped RPC_E_WRONG_THREAD because the
-        // EffectGraphFile::Save path touches non-agile XAML/Storage
-        // objects indirectly; keeping it on the UI thread side-steps
-        // that entire class of marshalling bug.
-        namespace XC = winrt::Microsoft::UI::Xaml::Controls;
-        XC::ContentDialog dialog;
-        dialog.XamlRoot(this->Content().XamlRoot());
-        dialog.Title(winrt::box_value(L"Saving graph"));
-
-        XC::TextBlock statusLine;
-        statusLine.Text(L"Preparing\u2026");
-        statusLine.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::NoWrap);
-        XC::ProgressBar bar;
-        bar.IsIndeterminate(false);
-        bar.Minimum(0); bar.Maximum(1); bar.Value(0); bar.Width(360);
-        XC::StackPanel sp;
-        sp.Spacing(8);
-        sp.Children().Append(statusLine);
-        sp.Children().Append(bar);
-        dialog.Content(sp);
-
-        // Show the dialog asynchronously, then yield once so XAML
-        // gets a chance to lay it out before kicking off the save on
-        // a background thread. Progress callbacks marshal back to the
-        // UI thread via DispatcherQueue so the bar actually animates
-        // while miniz is compressing media.
-        winrt::apartment_context ui_thread;
-        auto showOp = dialog.ShowAsync();
-        co_await winrt::resume_after(std::chrono::milliseconds(16));
-        co_await ui_thread;
-
-        // Build media entries + rewritten JSON exactly like the sync
-        // path, then drive a single synchronous save with a progress
-        // callback that updates the dialog in-place.
-        std::vector<::ShaderLab::Rendering::EffectGraphFile::MediaEntry> media;
-        std::map<uint32_t, std::wstring> rewriteToToken;
-        if (m_embedMedia)
-        {
-            std::set<std::wstring> usedNames;
-            for (const auto& n : m_graph.Nodes())
-            {
-                if (n.type != ::ShaderLab::Graph::NodeType::Source) continue;
-                if (!n.shaderPath.has_value()) continue;
-                const std::wstring& p = n.shaderPath.value();
-                if (p.empty() || p.starts_with(L"media://")) continue;
-                if (!std::filesystem::exists(p)) continue;
-
-                std::wstring base = std::filesystem::path(p).filename().wstring();
-                std::wstring name = base;
-                int suffix = 2;
-                while (usedNames.count(name))
-                {
-                    auto stem = std::filesystem::path(base).stem().wstring();
-                    auto ext = std::filesystem::path(base).extension().wstring();
-                    name = stem + L"-" + std::to_wstring(suffix++) + ext;
-                }
-                usedNames.insert(name);
-
-                ::ShaderLab::Rendering::EffectGraphFile::MediaEntry me;
-                me.zipEntryName = L"media/" + name;
-                me.sourcePath = p;
-                media.push_back(std::move(me));
-                rewriteToToken[n.id] = L"media://" + name;
-            }
-        }
-
-        std::wstring jsonText;
-        if (rewriteToToken.empty())
-        {
-            jsonText = std::wstring(m_graph.ToJson());
-        }
-        else
-        {
-            ::ShaderLab::Graph::EffectGraph clone = m_graph;
-            for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(clone.Nodes()))
-            {
-                auto it = rewriteToToken.find(n.id);
-                if (it == rewriteToToken.end()) continue;
-                n.shaderPath = it->second;
-                auto pit = n.properties.find(L"shaderPath");
-                if (pit != n.properties.end())
-                    pit->second = it->second;
-            }
-            jsonText = std::wstring(clone.ToJson());
-        }
-
-        // Synchronous progress callback: marshal each update back to
-        // the UI thread via DispatcherQueue so the dialog actually
-        // animates while the background save runs. The callback
-        // itself returns immediately -- we don't wait for the marshal
-        // to complete (best-effort visual feedback, latest value
-        // wins).
-        auto dispatcher = this->DispatcherQueue();
-        auto progressCb = [dispatcher, statusLine, bar]
-            (uint32_t cur, uint32_t total, const std::wstring& msg) -> bool
-        {
-            dispatcher.TryEnqueue([statusLine, bar, cur, total, msg]() {
-                bar.Maximum(static_cast<double>(total));
-                bar.Value(static_cast<double>(cur));
-                statusLine.Text(winrt::hstring(msg));
-            });
-            return true;
-        };
-
-        // Run the actual save on a threadpool thread. EffectGraphFile::Save
-        // is pure native code (file IO + miniz) -- no XAML or WinRT
-        // marshalling -- so this is safe. Without this, miniz blocks the
-        // UI thread for tens of seconds on large media payloads and the
-        // ProgressBar never repaints.
-        std::wstring path = m_currentFilePath;
-        bool ok = false;
-        co_await winrt::resume_background();
-        try
-        {
-            ok = ::ShaderLab::Rendering::EffectGraphFile::Save(
-                path, jsonText, media, progressCb);
-        }
-        catch (...)
-        {
-            ok = false;
-        }
-        co_await ui_thread;
-
-        dialog.Hide();
-        co_await showOp;
-
-        if (ok)
-        {
-            m_unsavedChanges = false;
-            RefreshTitleBar();
-            PipelineFormatText().Text(
-                L"Graph saved: " +
-                winrt::hstring(std::filesystem::path(m_currentFilePath).filename().wstring()));
-        }
-        else
-        {
-            PipelineFormatText().Text(L"Error: Failed to save graph");
-        }
-    }
-
-    winrt::fire_and_forget MainWindow::SaveGraphAsync()
-    {
-        auto strong = get_strong();
-        try
-        {
-            // If we already have a destination from a previous save / load,
-            // overwrite silently -- this is the standard "Ctrl+S" path.
-            if (!m_currentFilePath.empty())
-            {
-                co_await RunSaveWithProgressAsync();
-                co_return;
-            }
-            co_await SaveGraphAsAsync();
-        }
-        catch (winrt::hresult_error const& e)
-        {
-            try
-            {
-                PipelineFormatText().Text(
-                    winrt::hstring(L"Save failed: ") + e.message());
-            }
-            catch (...) {}
-        }
-        catch (...)
-        {
-            try { PipelineFormatText().Text(L"Save failed: unknown error"); }
-            catch (...) {}
-        }
-    }
-
-    winrt::Windows::Foundation::IAsyncAction MainWindow::SaveGraphAsAsync()
-    {
-        auto strong = get_strong();
-
-        winrt::Windows::Storage::Pickers::FileSavePicker picker;
-        picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
-        picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::DocumentsLibrary);
-        picker.SuggestedFileName(
-            m_currentFilePath.empty() ? winrt::hstring(L"graph") :
-            winrt::hstring(std::filesystem::path(m_currentFilePath).stem().wstring()));
-        picker.FileTypeChoices().Insert(L"ShaderLab Graph",
-            winrt::single_threaded_vector<winrt::hstring>({ L".effectgraph" }));
-
-        auto file = co_await picker.PickSaveFileAsync();
-        if (!file) co_return;
-
-        m_currentFilePath = std::wstring(file.Path());
-
-        // Count source nodes that reference an external file. If
-        // there is at least one, ask the user whether to embed the
-        // media. The system FileSavePicker doesn't have a hook for
-        // extra options, so we ask via a follow-up ContentDialog.
-        bool hasExternalMedia = false;
-        for (const auto& n : m_graph.Nodes())
-        {
-            if (n.type == ::ShaderLab::Graph::NodeType::Source &&
-                n.shaderPath.has_value() && !n.shaderPath->empty() &&
-                !n.shaderPath->starts_with(L"media://") &&
-                std::filesystem::exists(*n.shaderPath))
-            {
-                hasExternalMedia = true;
-                break;
-            }
-        }
-
-        if (hasExternalMedia)
-        {
-            namespace XC = winrt::Microsoft::UI::Xaml::Controls;
-            XC::ContentDialog dialog;
-            dialog.XamlRoot(this->Content().XamlRoot());
-            dialog.Title(winrt::box_value(L"Embed media?"));
-            XC::CheckBox cb;
-            cb.Content(winrt::box_value(winrt::hstring(
-                L"Embed referenced images / videos / ICC files inside the .effectgraph")));
-            // Default to last-used preference. We deliberately don't pre-set
-            // IsChecked via IReference<bool> -- that path has been fragile in
-            // this WinRT version. Users can toggle and we read it back below.
-            XC::TextBlock blurb;
-            blurb.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap);
-            blurb.Opacity(0.7);
-            blurb.Margin({ 0, 8, 0, 0 });
-            blurb.Text(L"Embedding makes the graph portable -- the recipient won't need the "
-                       L"original file paths. Without embedding, the saved graph stores "
-                       L"absolute paths that may break on another machine.");
-            XC::StackPanel sp;
-            sp.Orientation(winrt::Microsoft::UI::Xaml::Controls::Orientation::Vertical);
-            sp.Children().Append(cb);
-            sp.Children().Append(blurb);
-            dialog.Content(sp);
-            dialog.PrimaryButtonText(L"Save");
-            dialog.CloseButtonText(L"Cancel");
-            dialog.DefaultButton(XC::ContentDialogButton::Primary);
-            auto result = co_await dialog.ShowAsync();
-            if (result != XC::ContentDialogResult::Primary)
-            {
-                m_currentFilePath.clear();
-                co_return;
-            }
-            auto checked = cb.IsChecked();
-            m_embedMedia = checked && checked.Value();
-        }
-
-        co_await RunSaveWithProgressAsync();
-    }
-
-    winrt::fire_and_forget MainWindow::LoadGraphAsync()
-    {
-        auto strong = get_strong();
-
-        winrt::Windows::Storage::Pickers::FileOpenPicker picker;
-        picker.as<::IInitializeWithWindow>()->Initialize(m_hwnd);
-        picker.SuggestedStartLocation(winrt::Windows::Storage::Pickers::PickerLocationId::DocumentsLibrary);
-        picker.FileTypeFilter().Append(L".effectgraph");
-
-        auto file = co_await picker.PickSingleFileAsync();
-        if (!file) co_return;
-
-        co_await LoadGraphFromPathAsync(file.Path());
-    }
-
-    winrt::Windows::Foundation::IAsyncAction MainWindow::LoadGraphFromPathAsync(winrt::hstring path)
-    {
-        auto strong = get_strong();
-        std::wstring pathStr(path);
-        std::wstring versionError;
-        std::wstring fileName = std::filesystem::path(pathStr).filename().wstring();
-
-        // Build the progress dialog and run the actual load on a
-        // background thread so big media archives don't freeze the UI.
-        namespace XC = winrt::Microsoft::UI::Xaml::Controls;
-        XC::ContentDialog dialog;
-        dialog.XamlRoot(this->Content().XamlRoot());
-        dialog.Title(winrt::box_value(L"Loading graph"));
-        XC::TextBlock statusLine;
-        statusLine.Text(L"Reading\u2026");
-        XC::ProgressBar bar;
-        bar.Minimum(0); bar.Maximum(1); bar.Value(0); bar.Width(360);
-        XC::StackPanel sp;
-        sp.Spacing(8);
-        sp.Children().Append(statusLine);
-        sp.Children().Append(bar);
-        dialog.Content(sp);
-
-        auto dispatcher = this->DispatcherQueue();
-        std::optional<::ShaderLab::Rendering::EffectGraphFile::LoadResult> loadResult;
-        std::wstring loadError;
-
-        // Show the progress dialog, yield once for layout, then run
-        // the load on a background thread so miniz inflate doesn't
-        // freeze the UI on big media archives.
-        winrt::apartment_context ui_thread;
-        auto showOp = dialog.ShowAsync();
-        co_await winrt::resume_after(std::chrono::milliseconds(16));
-        co_await ui_thread;
-
-        wchar_t tempBuf[MAX_PATH + 1]{};
-        DWORD len = ::GetTempPathW(MAX_PATH, tempBuf);
-        std::wstring tempRoot = (len > 0) ? std::wstring(tempBuf, len) : std::wstring(L".\\");
-
-        auto progressCb = [dispatcher, statusLine, bar]
-            (uint32_t cur, uint32_t total, const std::wstring& msg) -> bool
-        {
-            dispatcher.TryEnqueue([statusLine, bar, cur, total, msg]() {
-                bar.Maximum(static_cast<double>(total));
-                bar.Value(static_cast<double>(cur));
-                statusLine.Text(winrt::hstring(msg));
-            });
-            return true;
-        };
-
-        co_await winrt::resume_background();
-        try
-        {
-            auto r = ::ShaderLab::Rendering::EffectGraphFile::Load(pathStr, tempRoot, progressCb);
-            if (r.has_value()) loadResult = std::move(r);
-            else loadError = L"Could not read graph from .effectgraph";
-        }
-        catch (const std::exception& ex) { loadError = winrt::to_hstring(ex.what()); }
-        catch (...)                       { loadError = L"Unknown load failure"; }
-        co_await ui_thread;
-
-        dialog.Hide();
-        co_await showOp;
-
-        if (!loadResult.has_value())
-        {
-            // Defer the error path through the existing dialog so
-            // versioning errors and IO errors look the same to users.
-            versionError = loadError.empty() ? L"Failed to load graph" : loadError;
-        }
-        else
-        {
-            try
-            {
-                auto loaded = ::ShaderLab::Graph::EffectGraph::FromJson(
-                    winrt::hstring(loadResult->graphJson));
-
-                // Rewrite media:// tokens on source nodes to the
-                // extracted temp paths so the live graph can render
-                // them through the existing image / video pipeline.
-                for (auto& n : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(loaded.Nodes()))
-                {
-                    if (n.type != ::ShaderLab::Graph::NodeType::Source) continue;
-                    if (!n.shaderPath.has_value()) continue;
-                    auto it = loadResult->mediaMap.find(*n.shaderPath);
-                    if (it != loadResult->mediaMap.end())
-                    {
-                        n.shaderPath = it->second;
-                        auto pit = n.properties.find(L"shaderPath");
-                        if (pit != n.properties.end())
-                            pit->second = it->second;
-                    }
-                }
-
-                m_graphEvaluator.ReleaseCache(m_graph);
-                m_graph = std::move(loaded);
-                m_currentFilePath = pathStr;
-                m_unsavedChanges = false;
-                if (!loadResult->extractDir.empty()
-                    && std::filesystem::exists(loadResult->extractDir))
-                {
-                    m_extractedMediaDirs.push_back(loadResult->extractDir);
-                    // Touch heartbeat immediately so a concurrent
-                    // instance starting up doesn't reap us.
-                    TouchHeartbeats();
-                    StartHeartbeatTimer();
-                }
-
-                ResetAfterGraphLoad();
-                RefreshTitleBar();
-                PipelineFormatText().Text(L"Graph loaded: " + winrt::hstring(fileName));
-            }
-            catch (const std::runtime_error& ex)
-            {
-                versionError = winrt::to_hstring(ex.what());
-            }
-            catch (const std::exception& ex)
-            {
-                PipelineFormatText().Text(L"Load error: " + winrt::to_hstring(ex.what()));
-            }
-            catch (...)
-            {
-                PipelineFormatText().Text(L"Error: Failed to load graph");
-            }
-        }
-
-        if (!versionError.empty())
-        {
-            auto edialog = winrt::Microsoft::UI::Xaml::Controls::ContentDialog();
-            edialog.XamlRoot(this->Content().XamlRoot());
-            edialog.Title(winrt::box_value(L"Cannot Open Graph"));
-            edialog.Content(winrt::box_value(winrt::hstring(versionError)));
-            edialog.CloseButtonText(L"OK");
-            co_await edialog.ShowAsync();
-        }
-    }
-
-    winrt::Windows::Foundation::IAsyncOperation<int32_t> MainWindow::PromptUnsavedChangesAsync()
-    {
-        auto strong = get_strong();
-        auto dialog = winrt::Microsoft::UI::Xaml::Controls::ContentDialog();
-        dialog.XamlRoot(this->Content().XamlRoot());
-        dialog.Title(winrt::box_value(L"Unsaved changes"));
-        std::wstring fname = m_currentFilePath.empty() ? std::wstring(L"this graph") :
-            std::filesystem::path(m_currentFilePath).filename().wstring();
-        dialog.Content(winrt::box_value(winrt::hstring(
-            L"You have unsaved changes to " + fname + L". Save before closing?")));
-        dialog.PrimaryButtonText(L"Save");
-        dialog.SecondaryButtonText(L"Discard");
-        dialog.CloseButtonText(L"Cancel");
-        dialog.DefaultButton(winrt::Microsoft::UI::Xaml::Controls::ContentDialogButton::Primary);
-        auto result = co_await dialog.ShowAsync();
-        switch (result)
-        {
-            case winrt::Microsoft::UI::Xaml::Controls::ContentDialogResult::Primary:   co_return 0; // Save
-            case winrt::Microsoft::UI::Xaml::Controls::ContentDialogResult::Secondary: co_return 1; // Discard
-            default:                                                                   co_return 2; // Cancel
-        }
-    }
-
-    // ---- Heartbeat / temp-dir reaper ----------------------------------------
-    //
-    // Every extracted .effectgraph media dir gets a .heartbeat file
-    // that we touch every HeartbeatIntervalSec. On startup we scan
-    // %TEMP% for ShaderLab-* directories whose .heartbeat (or, if
-    // missing, mtime of the dir itself) is older than HeartbeatStaleSec
-    // -- those are crash leftovers and we offer to delete them.
-
-    void MainWindow::StartHeartbeatTimer()
-    {
-        if (m_heartbeatTimer) return;
-        m_heartbeatTimer = DispatcherQueue().CreateTimer();
-        m_heartbeatTimer.Interval(std::chrono::seconds(HeartbeatIntervalSec));
-        m_heartbeatTimer.Tick([this](auto&&, auto&&) { TouchHeartbeats(); });
-        m_heartbeatTimer.Start();
-    }
-
-    void MainWindow::TouchHeartbeats()
-    {
-        // Write the current FILETIME into <dir>\.heartbeat. Cheap
-        // (one tiny file write per loaded graph, every minute) and
-        // resilient to clock skew because we only compare against
-        // FILETIMEs from the same machine.
-        FILETIME now{};
-        ::GetSystemTimeAsFileTime(&now);
-        for (const auto& d : m_extractedMediaDirs)
-        {
-            std::error_code ec;
-            if (!std::filesystem::exists(d, ec)) continue;
-            std::wstring path = d + L"\\.heartbeat";
-            HANDLE h = ::CreateFileW(path.c_str(),
-                GENERIC_WRITE, 0, nullptr,
-                CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
-            if (h == INVALID_HANDLE_VALUE) continue;
-            DWORD written = 0;
-            ::WriteFile(h, &now, sizeof(now), &written, nullptr);
-            ::CloseHandle(h);
-        }
-    }
-
-    winrt::fire_and_forget MainWindow::ReapStaleMediaDirsAsync()
-    {
-        auto strong = get_strong();
-
-        // Snapshot %TEMP% and look for ShaderLab-* directories that
-        // either have no .heartbeat or whose heartbeat is older than
-        // HeartbeatStaleSec. Anything matching is from a crashed
-        // instance (or a previous version that didn't write
-        // heartbeats); offer to delete the lot.
-        wchar_t tempBuf[MAX_PATH + 1]{};
-        DWORD len = ::GetTempPathW(MAX_PATH, tempBuf);
-        if (len == 0) co_return;
-        std::wstring tempRoot(tempBuf, len);
-
-        std::vector<std::wstring> stale;
-        FILETIME nowFt{};
-        ::GetSystemTimeAsFileTime(&nowFt);
-        const uint64_t now = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
-        const uint64_t staleTicks = static_cast<uint64_t>(HeartbeatStaleSec) * 10'000'000ULL;
-
-        std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(tempRoot, ec))
-        {
-            if (ec) break;
-            if (!entry.is_directory(ec)) continue;
-            const auto name = entry.path().filename().wstring();
-            if (!name.starts_with(L"ShaderLab-")) continue;
-
-            // Determine the dir's "last touched" time. Prefer the
-            // .heartbeat file's mtime; fall back to the directory's
-            // own mtime so directories from older builds (which
-            // didn't write heartbeats) still get reaped.
-            FILETIME ft{};
-            std::wstring beat = entry.path().wstring() + L"\\.heartbeat";
-            HANDLE h = ::CreateFileW(beat.c_str(),
-                GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_HIDDEN, nullptr);
-            if (h != INVALID_HANDLE_VALUE)
-            {
-                ::GetFileTime(h, nullptr, nullptr, &ft);
-                ::CloseHandle(h);
-            }
-            else
-            {
-                WIN32_FILE_ATTRIBUTE_DATA fad{};
-                if (::GetFileAttributesExW(entry.path().c_str(), GetFileExInfoStandard, &fad))
-                    ft = fad.ftLastWriteTime;
-            }
-            const uint64_t touched = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-            if (touched == 0 || (now > touched && (now - touched) > staleTicks))
-                stale.push_back(entry.path().wstring());
-        }
-
-        if (stale.empty()) co_return;
-
-        namespace XC = winrt::Microsoft::UI::Xaml::Controls;
-        XC::ContentDialog dialog;
-        dialog.XamlRoot(this->Content().XamlRoot());
-        dialog.Title(winrt::box_value(L"Clean up old graph media?"));
-
-        std::wstring msg = std::format(
-            L"Found {} ShaderLab media folder{} in your %TEMP% from a "
-            L"previous session that didn't shut down cleanly. They are "
-            L"only useful while the graph that produced them is open.\n\nDelete them now?",
-            stale.size(), stale.size() == 1 ? L"" : L"s");
-        XC::TextBlock blurb;
-        blurb.Text(winrt::hstring(msg));
-        blurb.TextWrapping(winrt::Microsoft::UI::Xaml::TextWrapping::Wrap);
-        dialog.Content(blurb);
-        dialog.PrimaryButtonText(L"Delete");
-        dialog.CloseButtonText(L"Keep");
-        dialog.DefaultButton(XC::ContentDialogButton::Primary);
-
-        auto result = co_await dialog.ShowAsync();
-        if (result != XC::ContentDialogResult::Primary) co_return;
-
-        co_await winrt::resume_background();
-        std::error_code rmEc;
-        for (const auto& d : stale)
-            std::filesystem::remove_all(d, rmEc);
-    }
-
-    void MainWindow::ResetAfterGraphLoad(bool reopenOutputWindows)
-    {
-        m_previewNodeId = 0;
-        m_traceActive = false;
-        m_lastTraceTopologyHash = 0;
-        m_traceRowCache.clear();
-
-        // Close all existing output windows.
-        m_outputWindows.clear();
-
-        m_nodeGraphController.SetGraph(&m_graph);
-
-        // Restore isClock flag from ShaderLab effect descriptors
-        // (not serialized in JSON, derived from effect definition).
-        {
-            auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
-            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-            {
-                if (node.customEffect.has_value() && !node.customEffect->shaderLabEffectId.empty())
-                {
-                    auto* desc = lib.FindById(node.customEffect->shaderLabEffectId);
-                    if (desc)
-                        node.isClock = desc->isClock;
-                }
-            }
-        }
-
-        m_graph.MarkAllDirty();
-        PopulatePreviewNodeSelector();
-
-        // Reset trace UI.
-        PixelTracePanel().Children().Clear();
-        TracePositionText().Text(L"Click preview to trace a pixel");
-
-        // Defer FitPreviewToView until after the first evaluation
-        // produces valid cachedOutput (image bounds aren't available yet).
-        m_needsFitPreview = true;
-        UpdateStatusBar();
-
-        // Reopen output windows for all Output nodes in the loaded graph.
-        if (reopenOutputWindows)
-        {
-            auto outputIds = m_graph.GetOutputNodeIds();
-            for (uint32_t id : outputIds)
-            {
-                try { OpenOutputWindow(id); } catch (...) {}
-            }
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Add node
     // -----------------------------------------------------------------------
@@ -3066,29 +2081,11 @@ namespace winrt::ShaderLab::implementation
         }
 
         auto point = args.GetCurrentPoint(PreviewPanel());
-        auto scale = PreviewPanel().CompositionScaleX();
-        uint32_t px = static_cast<uint32_t>(point.Position().X * scale);
-        uint32_t py = static_cast<uint32_t>(point.Position().Y * scale);
-
-        // Single-pixel readback at cursor position from the previewed node.
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return;
-
-        auto* previewImage = GetPreviewImage();
-        if (!previewImage)
-        {
-            CursorReadoutText().Text(L"");
-            return;
-        }
-
-        // Lightweight readback: inspect the previewed node at cursor position.
-        if (m_pixelInspector.InspectPixel(dc, m_graph, m_previewNodeId, px, py))
-        {
-            const auto& p = m_pixelInspector.LastPixel();
-            CursorReadoutText().Text(std::format(
-                L"({},{}) R:{:.3f} G:{:.3f} B:{:.3f} \u00B7 {:.0f} nits",
-                px, py, p.scR, p.scG, p.scB, p.luminanceNits));
-        }
+        // Status-bar pixel-readout was removed (it forced a per-mouse-move
+        // GPU readback for a single-pixel display that crowded out the FPS
+        // counter at low frame rates). The Pixel Trace tab is the
+        // canonical place for cursor-coordinate inspection now.
+        (void)point;
     }
 
     // -----------------------------------------------------------------------
@@ -3724,6 +2721,31 @@ namespace winrt::ShaderLab::implementation
         args.Handled(true);
     }
 
+    bool MainWindow::IsPropertiesPanelInteracting()
+    {
+        // Walks the focused element's parent chain looking for the
+        // PropertiesPanel StackPanel. If found, the user is mid-edit on
+        // some control inside the panel and a Clear() + recreate would
+        // destroy their in-progress input. Used by the 4 Hz binding-value
+        // refresh on Clock-driven graphs.
+        try
+        {
+            auto root = this->Content().XamlRoot();
+            if (!root) return false;
+            auto focused = winrt::Microsoft::UI::Xaml::Input::FocusManager::GetFocusedElement(root);
+            auto cur = focused.try_as<winrt::Microsoft::UI::Xaml::DependencyObject>();
+            auto target = PropertiesPanel().try_as<winrt::Microsoft::UI::Xaml::DependencyObject>();
+            if (!cur || !target) return false;
+            for (int hops = 0; hops < 64 && cur; ++hops)
+            {
+                if (cur == target) return true;
+                cur = winrt::Microsoft::UI::Xaml::Media::VisualTreeHelper::GetParent(cur);
+            }
+        }
+        catch (...) {}
+        return false;
+    }
+
     void MainWindow::UpdatePropertiesPanel()
     {
         namespace Controls = winrt::Microsoft::UI::Xaml::Controls;
@@ -3868,6 +2890,7 @@ namespace winrt::ShaderLab::implementation
 
         // ---- Image source: file path + Browse button ----
         bool isVideoSource = false;
+        bool isLiveCaptureSource = false;
         {
             auto isVideoIt = node->properties.find(L"IsVideo");
             if (isVideoIt != node->properties.end())
@@ -3875,10 +2898,23 @@ namespace winrt::ShaderLab::implementation
                 auto* bv = std::get_if<bool>(&isVideoIt->second);
                 if (bv && *bv) isVideoSource = true;
             }
+            // DXGI Desktop Duplication / Windows Graphics Capture sources
+            // own their bitmap from a live capture provider; they have no
+            // file path to browse to and the "Image Path" UI is misleading.
+            for (const auto* key : { L"IsDxgiDuplicateOutput", L"IsWindowsGraphicsCapture" })
+            {
+                auto it = node->properties.find(key);
+                if (it != node->properties.end())
+                {
+                    auto* bv = std::get_if<bool>(&it->second);
+                    if (bv && *bv) { isLiveCaptureSource = true; break; }
+                }
+            }
         }
 
         if (node->type == ::ShaderLab::Graph::NodeType::Source &&
-            !(node->effectClsid.has_value()) && !isVideoSource)
+            !(node->effectClsid.has_value()) &&
+            !isVideoSource && !isLiveCaptureSource)
         {
             auto pathLabel = Controls::TextBlock();
             pathLabel.Text(L"Image Path");
@@ -4059,9 +3095,6 @@ namespace winrt::ShaderLab::implementation
                     continue;
                 // Math Expression: Expression is rendered above as a dedicated control.
                 if (isMathExpression && key == L"Expression")
-                    continue;
-                // Skip hidden properties (convention: name ends with _hidden).
-                if (key.size() > 7 && key.ends_with(L"_hidden"))
                     continue;
                 // For nodes with a customEffect, only render properties that
                 // correspond to a declared parameter. Properties that exist
@@ -5982,108 +5015,31 @@ namespace winrt::ShaderLab::implementation
         auto* dc = m_renderEngine.D2DDeviceContext();
         if (!dc) return false;
 
+        // Force a fresh frame so dirty nodes evaluate before readback.
+        // The engine helper (Rendering::ReadPixelRegion) is otherwise
+        // pure -- doesn't drive eval -- so the host has to ensure the
+        // graph is up-to-date.
         RenderFrame();
 
-        auto* image = ResolveDisplayImage(nodeId);
-        if (!image)
+        auto result = ::ShaderLab::Rendering::ReadPixelRegion(
+            m_graph, nodeId, x, y, w, h, dc);
+
+        switch (result.status)
         {
-            auto* node = m_graph.FindNode(nodeId);
-            if (!node) outNotFound = true;
-            else       outNotReady = true;
-            return false;
-        }
-
-        // Use 96 DPI so GetImageLocalBounds returns pixel coordinates.
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
-        dc->SetDpi(96.0f, 96.0f);
-
-        D2D1_RECT_F bounds{};
-        dc->GetImageLocalBounds(image, &bounds);
-        const int32_t imgW = static_cast<int32_t>(bounds.right - bounds.left);
-        const int32_t imgH = static_cast<int32_t>(bounds.bottom - bounds.top);
-        if (imgW <= 0 || imgH <= 0) { dc->SetDpi(oldDpiX, oldDpiY); return false; }
-
-        // Clip the requested region to the image bounds (in image-local pixel
-        // coordinates).  `bounds.left/top` may be non-zero for sources whose
-        // origin isn't at (0,0), so use them as the offset.
-        int32_t x0 = (std::max)(x, 0);
-        int32_t y0 = (std::max)(y, 0);
-        int32_t x1 = (std::min)(static_cast<int32_t>(x + w), imgW);
-        int32_t y1 = (std::min)(static_cast<int32_t>(y + h), imgH);
-        if (x1 <= x0 || y1 <= y0) { dc->SetDpi(oldDpiX, oldDpiY); return false; }
-
-        const uint32_t actW = static_cast<uint32_t>(x1 - x0);
-        const uint32_t actH = static_cast<uint32_t>(y1 - y0);
-
-        try
-        {
-            // FP32 RGBA target so we get the linear scRGB values directly,
-            // matching the convention used by PixelInspectorController.
-            winrt::com_ptr<ID2D1Bitmap1> targetBitmap;
-            D2D1_BITMAP_PROPERTIES1 bmpProps = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_TARGET,
-                D2D1::PixelFormat(DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED),
-                96.0f, 96.0f);
-            winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(actW, actH), nullptr, 0, bmpProps, targetBitmap.put()));
-
-            winrt::com_ptr<ID2D1Image> oldTarget;
-            dc->GetTarget(oldTarget.put());
-            dc->SetTarget(targetBitmap.get());
-            dc->BeginDraw();
-            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-            dc->SetTransform(D2D1::Matrix3x2F::Identity());
-
-            // SOURCE_COPY + NEAREST_NEIGHBOR copies raw values without any
-            // alpha blend or filtering, matching the inspector's readback path.
-            // DrawImage(image, targetOffset, imageRect, ...) is always 1:1, so
-            // a srcRect of size (actW, actH) at offset (0,0) in the target lands
-            // exactly the requested region into our bitmap.
-            const float fx0 = static_cast<float>(x0) + bounds.left;
-            const float fy0 = static_cast<float>(y0) + bounds.top;
-            const float fx1 = static_cast<float>(x1) + bounds.left;
-            const float fy1 = static_cast<float>(y1) + bounds.top;
-            D2D1_POINT_2F destOffset = D2D1::Point2F(0.0f, 0.0f);
-            D2D1_RECT_F srcRect = D2D1::RectF(fx0, fy0, fx1, fy1);
-            dc->DrawImage(image, &destOffset, &srcRect,
-                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                D2D1_COMPOSITE_MODE_SOURCE_COPY);
-            dc->EndDraw();
-            dc->SetTarget(oldTarget.get());
-
-            // Copy GPU bitmap to a CPU-readable bitmap and Map it.
-            winrt::com_ptr<ID2D1Bitmap1> cpuBitmap;
-            D2D1_BITMAP_PROPERTIES1 cpuProps = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                D2D1::PixelFormat(DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED),
-                96.0f, 96.0f);
-            winrt::check_hresult(dc->CreateBitmap(D2D1::SizeU(actW, actH), nullptr, 0, cpuProps, cpuBitmap.put()));
-            D2D1_POINT_2U destPt = { 0, 0 };
-            D2D1_RECT_U srcRc = { 0, 0, actW, actH };
-            winrt::check_hresult(cpuBitmap->CopyFromBitmap(&destPt, targetBitmap.get(), &srcRc));
-
-            D2D1_MAPPED_RECT mapped{};
-            winrt::check_hresult(cpuBitmap->Map(D2D1_MAP_OPTIONS_READ, &mapped));
-
-            outPixels.resize(static_cast<size_t>(actW) * actH * 4);
-            for (uint32_t row = 0; row < actH; ++row)
-            {
-                const float* srcRow = reinterpret_cast<const float*>(
-                    mapped.bits + static_cast<size_t>(row) * mapped.pitch);
-                std::memcpy(outPixels.data() + static_cast<size_t>(row) * actW * 4,
-                            srcRow,
-                            static_cast<size_t>(actW) * 4 * sizeof(float));
-            }
-            cpuBitmap->Unmap();
-
-            outActualW = actW;
-            outActualH = actH;
-            dc->SetDpi(oldDpiX, oldDpiY);
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::Success:
+            outPixels = std::move(result.pixels);
+            outActualW = result.actualWidth;
+            outActualH = result.actualHeight;
             return true;
-        }
-        catch (...)
-        {
-            dc->SetDpi(oldDpiX, oldDpiY);
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::NotFound:
+            outNotFound = true;
+            return false;
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::NotReady:
+            outNotReady = true;
+            return false;
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::InvalidRegion:
+        case ::ShaderLab::Rendering::ReadPixelRegionStatus::D2DError:
+        default:
             return false;
         }
     }
@@ -6435,499 +5391,9 @@ namespace winrt::ShaderLab::implementation
     }
 
     // -----------------------------------------------------------------------
-    // Render loop
+    // Render loop -- methods (OnRenderTick, RenderFrame) moved to
+    // MainWindow.RenderTick.cpp (Phase 4 split). Members of same class.
     // -----------------------------------------------------------------------
-
-    void MainWindow::OnRenderTick(
-        winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer const& /*sender*/,
-        winrt::Windows::Foundation::IInspectable const& /*args*/)
-    {
-        if (m_isShuttingDown) return;
-        if (!m_renderEngine.IsInitialized()) return;
-
-        try
-        {
-        // Compute frame delta time.
-        auto now = std::chrono::steady_clock::now();
-        double deltaSec = std::chrono::duration<double>(now - m_lastRenderTick).count();
-        m_lastRenderTick = now;
-        // Clamp to avoid huge jumps (e.g., after breakpoint or sleep).
-        if (deltaSec > 0.1) deltaSec = 0.016;
-
-        // Mirror the active display profile into Working Space parameter
-        // nodes. This is a cheap node-list walk that no-ops when no
-        // Working Space nodes are present and only marks dirty when at
-        // least one field actually changed, so freshly-added nodes pick
-        // up live values immediately without hooking every AddNode site.
-        UpdateWorkingSpaceNodes();
-
-        // Tick clock nodes: advance time.
-        for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-        {
-            if (node.isClock)
-            {
-                auto getF = [&](const std::wstring& k, float def) {
-                    auto it = node.properties.find(k);
-                    if (it != node.properties.end())
-                        if (auto* f = std::get_if<float>(&it->second)) return *f;
-                    return def;
-                };
-
-                bool autoDuration = getF(L"AutoDuration", 1.0f) > 0.5f;
-
-                // Disable AutoDuration if StopTime has an explicit binding.
-                if (autoDuration && node.propertyBindings.count(L"StopTime"))
-                {
-                    autoDuration = false;
-                    node.properties[L"AutoDuration"] = 0.0f;
-                }
-
-                // Auto-detect StopTime from downstream video durations.
-                // Data bindings don't create graph edges — scan all nodes
-                // for propertyBindings that reference this Clock.
-                if (autoDuration)
-                {
-                    float maxDur = 0.0f;
-                    for (const auto& other : m_graph.Nodes())
-                    {
-                        if (other.id == node.id) continue;
-                        // Check if this node has any property bound to our Clock.
-                        bool boundToThisClock = false;
-                        for (const auto& [propName, binding] : other.propertyBindings)
-                        {
-                            for (const auto& src : binding.sources)
-                            {
-                                if (src && src->sourceNodeId == node.id)
-                                { boundToThisClock = true; break; }
-                            }
-                            if (boundToThisClock) break;
-                        }
-                        if (!boundToThisClock) continue;
-                        for (const auto& field : other.analysisOutput.fields)
-                        {
-                            if (field.name == L"Duration" && field.components[0] > 0.0f)
-                                if (field.components[0] > maxDur) maxDur = field.components[0];
-                        }
-                    }
-                    if (maxDur > 0.0f)
-                        node.properties[L"StopTime"] = maxDur;
-                }
-
-                if (node.isPlaying)
-                {
-                    float startTime = getF(L"StartTime", 0.0f);
-                    float stopTime = getF(L"StopTime", 10.0f);
-                    float speed = getF(L"Speed", 1.0f);
-                    bool loop = getF(L"Loop", 1.0f) > 0.5f;
-
-                    double duration = static_cast<double>(stopTime - startTime);
-                    if (duration <= 0.0) duration = 1.0;
-
-                    node.clockTime += deltaSec * speed;
-
-                    if (loop)
-                    {
-                        while (node.clockTime >= duration) node.clockTime -= duration;
-                        while (node.clockTime < 0.0) node.clockTime += duration;
-                    }
-                    else
-                    {
-                        node.clockTime = std::clamp(node.clockTime, 0.0, duration);
-                        if (node.clockTime >= duration) node.isPlaying = false;
-                    }
-
-                    node.dirty = true;
-                    m_nodeGraphController.SetNeedsRedraw();
-                }
-            }
-        }
-
-        // Resolve source node property bindings (e.g., Clock.Time → Video.Time)
-        // BEFORE ticking video sources, so they see the updated time values.
-        m_graphEvaluator.ResolveSourceBindings(m_graph);
-
-        // Tick video sources and upload new frames.
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (dc)
-        {
-            try {
-                auto& nodes = const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes());
-                m_sourceFactory.TickAndUploadVideos(nodes, dc, deltaSec);
-                m_sourceFactory.TickAndUploadLiveCaptures(nodes, dc);
-            } catch (...) {}
-        }
-
-        // Propagate dirty flags downstream so D3D11 compute effects
-        // re-dispatch when upstream sources change (video frames, animation).
-        // Runs AFTER video tick so new-frame dirty flags reach compute nodes.
-        {
-            std::vector<uint32_t> queue;
-            for (const auto& node : m_graph.Nodes())
-                if (node.dirty) queue.push_back(node.id);
-            for (size_t i = 0; i < queue.size(); ++i)
-            {
-                for (const auto* edge : m_graph.GetOutputEdges(queue[i]))
-                {
-                    auto* dn = m_graph.FindNode(edge->destNodeId);
-                    if (dn && !dn->dirty)
-                    {
-                        dn->dirty = true;
-                        queue.push_back(edge->destNodeId);
-                    }
-                }
-            }
-        }
-
-        // Only re-evaluate the graph when something changed.
-        // Always render if output windows are open (they need continuous present).
-        bool wasForceRender = m_forceRender;
-        bool hasDirty = m_graph.HasDirtyNodes();
-        bool hasOutputWindows = !m_outputWindows.empty();
-        bool needsEval = hasDirty || m_needsFitPreview || m_forceRender || hasOutputWindows;
-        if (needsEval)
-        {
-            RenderFrame(deltaSec);
-            m_forceRender = false;
-            m_frameCount++;
-            // Rebuild layout only on user-initiated changes (not animation ticks)
-            // to update analysis display sizing without killing performance.
-            if (wasForceRender)
-                m_nodeGraphController.RebuildLayout();
-        }
-
-        RenderNodeGraph();
-
-        // Update video seek slider and position label while playing.
-        if (m_videoSeekSlider && m_videoSeekNodeId != 0)
-        {
-            auto* vp = m_sourceFactory.GetVideoProvider(m_videoSeekNodeId);
-            if (vp && vp->IsOpen())
-            {
-                double pos = vp->CurrentPosition();
-                m_videoSeekSuppressEvents = true;
-                m_videoSeekSlider.Value(pos);
-                m_videoSeekSuppressEvents = false;
-                if (m_videoPositionLabel)
-                    m_videoPositionLabel.Text(std::format(L"Position: {:.1f}s / {:.1f}s", pos, vp->Duration()));
-            }
-        }
-
-        // Update FPS counter every second (counts output frames only).
-        // Also update log windows at ~4Hz.
-        auto fpsNow = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(fpsNow - m_fpsTimePoint).count();
-        if (elapsed >= 250)
-        {
-            if (!m_logWindows.empty())
-                UpdateLogWindows();
-            // Refresh properties panel only when the selected node actually has
-            // a property binding whose live value can change frame to frame.
-            // Without this guard, video playback (which dirties graph nodes
-            // every frame) caused a 4 Hz rebuild of the entire properties
-            // panel -- visibly jittering Slider/NumberBox widths as auto-sized
-            // controls re-laid out.
-            if (m_selectedNodeId != 0 && m_graph.HasDirtyNodes())
-            {
-                auto* selNode = m_graph.FindNode(m_selectedNodeId);
-                if (selNode && !selNode->propertyBindings.empty())
-                    UpdatePropertiesPanel();
-            }
-            // Refresh MCP activity indicator (dot color fade + tooltip "Xs ago"
-            // counter).  Cheap when no activity has occurred.
-            UpdateMcpActivityIndicator();
-        }
-        if (elapsed >= 1000)
-        {
-            float fps = static_cast<float>(m_frameCount) * 1000.0f / static_cast<float>(elapsed);
-            auto& ft = m_frameTiming;
-
-            // Video decode FPS.
-            uint64_t currentVideoUploads = m_sourceFactory.TotalVideoUploads();
-            float videoFps = static_cast<float>(currentVideoUploads - m_lastVideoUploadCount) * 1000.0f / static_cast<float>(elapsed);
-            m_lastVideoUploadCount = currentVideoUploads;
-
-            if (videoFps > 0.1f)
-            {
-                FpsText().Text(std::format(L"{:.0f} FPS | {:.1f}ms (eval {:.1f} + compute {:.1f} + draw {:.1f}) | video {:.0f} fps",
-                    fps, ft.totalUs / 1000.0, ft.evaluateUs / 1000.0,
-                    ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0,
-                    videoFps));
-            }
-            else
-            {
-                FpsText().Text(std::format(L"{:.0f} FPS | {:.1f}ms (eval {:.1f} + compute {:.1f} + draw {:.1f})",
-                    fps, ft.totalUs / 1000.0, ft.evaluateUs / 1000.0,
-                    ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0));
-            }
-            m_frameCount = 0;
-            m_fpsTimePoint = fpsNow;
-        }
-
-        } // end try
-        catch (const winrt::hresult_error& ex)
-        {
-            OutputDebugStringW(std::format(L"[RenderTick] Exception: 0x{:08X}\n",
-                static_cast<uint32_t>(ex.code())).c_str());
-        }
-        catch (const std::exception& ex)
-        {
-            OutputDebugStringW(std::format(L"[RenderTick] std::exception: {}\n",
-                std::wstring(ex.what(), ex.what() + strlen(ex.what()))).c_str());
-        }
-        catch (...)
-        {
-            OutputDebugStringW(L"[RenderTick] Unknown exception\n");
-        }
-    }
-
-    void MainWindow::RenderFrame(double deltaSeconds)
-    {
-        if (!m_renderEngine.IsInitialized())
-            return;
-
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return;
-
-        auto tFrameStart = std::chrono::high_resolution_clock::now();
-
-        // Re-prepare dirty source nodes (e.g., Flood color changed, video frame advance).
-        for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-        {
-            if (node.type == ::ShaderLab::Graph::NodeType::Source &&
-                (node.dirty || m_sourceFactory.GetVideoProvider(node.id)))
-            {
-                try {
-                    m_sourceFactory.PrepareSourceNode(node, dc, deltaSeconds, m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-                } catch (...) {
-                    node.runtimeError = L"Source preparation failed";
-                    node.dirty = false;
-                }
-            }
-        }
-
-        // Compute which nodes are needed (feed a visible output).
-        // Start by marking all nodes unneeded, then mark roots and propagate upstream.
-        {
-            for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
-                node.needed = false;
-
-            // Roots: Output nodes, preview node, output window nodes.
-            // Data-only/analysis nodes are NOT automatic roots — they only
-            // evaluate when dirty or when something downstream needs them.
-            std::vector<uint32_t> roots;
-            for (const auto& node : m_graph.Nodes())
-            {
-                if (node.type == ::ShaderLab::Graph::NodeType::Output)
-                    roots.push_back(node.id);
-                // Only include data-only analysis nodes if they're dirty
-                // (need initial computation or property changed).
-                if (node.dirty && node.customEffect.has_value() &&
-                    node.customEffect->analysisOutputType == ::ShaderLab::Graph::AnalysisOutputType::Typed)
-                    roots.push_back(node.id);
-            }
-            if (m_previewNodeId != 0)
-                roots.push_back(m_previewNodeId);
-            for (const auto& window : m_outputWindows)
-                roots.push_back(window->NodeId());
-
-            // BFS upstream from roots.
-            std::unordered_set<uint32_t> visited;
-            std::vector<uint32_t> queue = roots;
-            while (!queue.empty())
-            {
-                uint32_t id = queue.back();
-                queue.pop_back();
-                if (visited.count(id)) continue;
-                visited.insert(id);
-                auto* node = m_graph.FindNode(id);
-                if (node) node->needed = true;
-                // Add all upstream nodes (via both image and data edges).
-                for (const auto* edge : m_graph.GetInputEdges(id))
-                    queue.push_back(edge->sourceNodeId);
-                // Add property binding sources.
-                if (node)
-                {
-                    for (const auto& [propName, binding] : node->propertyBindings)
-                    {
-                        if (binding.wholeArray)
-                            queue.push_back(binding.wholeArraySourceNodeId);
-                        for (const auto& src : binding.sources)
-                        {
-                            if (src.has_value())
-                                queue.push_back(src->sourceNodeId);
-                        }
-                    }
-                }
-            }
-        }
-
-        auto tSourcesEnd = std::chrono::high_resolution_clock::now();
-
-        // Evaluate the effect graph.
-        m_graphEvaluator.Evaluate(m_graph, dc);
-
-        // If any effects were newly created this frame, evaluate again immediately.
-        // D2D needs the first pass to initialize transform pipeline; the second
-        // pass produces correct output with the proper cbuffer values.
-        if (m_graph.HasDirtyNodes())
-            m_graphEvaluator.Evaluate(m_graph, dc);
-
-        auto tEvalEnd = std::chrono::high_resolution_clock::now();
-
-        // Deferred fit: after first evaluation with valid output, fit the preview.
-        if (m_needsFitPreview && GetPreviewImage())
-        {
-            m_needsFitPreview = false;
-            FitPreviewToView();
-        }
-
-        // Begin draw to swap chain.
-        auto* drawDc = m_renderEngine.BeginDraw();
-        if (!drawDc)
-            return;
-
-        // Process deferred D3D11 compute dispatches inside the active D2D
-        // draw session, where all effect chains are fully materialized.
-        uint32_t computeCount = static_cast<uint32_t>(m_graphEvaluator.DeferredComputeCount());
-        auto tComputeStart = std::chrono::high_resolution_clock::now();
-        if (m_graphEvaluator.ProcessDeferredCompute(m_graph, drawDc))
-        {
-            m_nodeGraphController.SetNeedsRedraw();
-            if (m_graph.HasDirtyNodes())
-                m_graphEvaluator.Evaluate(m_graph, drawDc);
-        }
-
-        auto tComputeEnd = std::chrono::high_resolution_clock::now();
-
-        // Log compute dispatch timing if it was slow (>10ms).
-        if (computeCount > 0)
-        {
-            double computeMs = std::chrono::duration<double, std::milli>(tComputeEnd - tComputeStart).count();
-            if (computeMs > 10.0)
-            {
-                // Log to each compute node that dispatched.
-                for (const auto& node : m_graph.Nodes())
-                {
-                    if (node.customEffect.has_value() &&
-                        node.customEffect->shaderType == ::ShaderLab::Graph::CustomShaderType::D3D11ComputeShader &&
-                        !node.outputPins.empty() && node.cachedOutput)
-                    {
-                        m_nodeLogs[node.id].Warning(
-                            std::format(L"Slow compute dispatch: {:.1f}ms ({} dispatches)", computeMs, computeCount));
-                    }
-                }
-            }
-        }
-
-        // Log per-node state changes (errors) — only on transitions.
-        for (const auto& node : m_graph.Nodes())
-        {
-            auto& log = m_nodeLogs[node.id];
-            // Log runtime errors when they change.
-            static std::unordered_map<uint32_t, std::wstring> s_lastError;
-            if (node.runtimeError != s_lastError[node.id])
-            {
-                s_lastError[node.id] = node.runtimeError;
-                if (!node.runtimeError.empty())
-                    log.Error(node.runtimeError);
-                else
-                    log.Info(L"Error cleared");
-            }
-        }
-
-        // Set DPI to 96 so D2D coordinates match WinUI DIPs exactly.
-        // The XAML compositor handles physical pixel scaling.
-        // This ensures the preview transform, crosshair overlay, and pixel
-        // trace coordinates all use the same coordinate space.
-        float oldDpiX, oldDpiY;
-        drawDc->GetDpi(&oldDpiX, &oldDpiY);
-        drawDc->SetDpi(96.0f, 96.0f);
-
-        drawDc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-
-        // Apply preview pan/zoom transform.
-        D2D1_MATRIX_3X2_F previewTransform =
-            D2D1::Matrix3x2F::Scale(m_previewZoom, m_previewZoom) *
-            D2D1::Matrix3x2F::Translation(m_previewPanX, m_previewPanY);
-        drawDc->SetTransform(previewTransform);
-
-        auto* previewImage = ResolveDisplayImage(m_previewNodeId);
-        if (previewImage)
-        {
-            drawDc->SetTransform(previewTransform);
-            drawDc->DrawImage(previewImage, m_previewZoom < 1.0 ? D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC : D2D1_INTERPOLATION_MODE_LINEAR);
-        }
-        else if (m_previewNodeId != 0)
-        {
-            // Draw "No Input" when previewing a node with broken upstream.
-            winrt::com_ptr<IDWriteFactory> dwFactory;
-            DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
-                __uuidof(IDWriteFactory), dwFactory.as<IUnknown>().put());
-            if (dwFactory)
-            {
-                winrt::com_ptr<IDWriteTextFormat> fmt;
-                dwFactory->CreateTextFormat(L"Segoe UI", nullptr,
-                    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL, 18.0f, L"en-us", fmt.put());
-                if (fmt)
-                {
-                    fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-                    fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-                    winrt::com_ptr<ID2D1SolidColorBrush> brush;
-                    drawDc->CreateSolidColorBrush(D2D1::ColorF(0.5f, 0.5f, 0.5f, 0.8f), brush.put());
-                    if (brush)
-                    {
-                        D2D1_SIZE_F sz = drawDc->GetSize();
-                        drawDc->DrawText(L"No Input", 8, fmt.get(),
-                            D2D1::RectF(0, 0, sz.width, sz.height), brush.get());
-                    }
-                }
-            }
-        }
-
-        drawDc->SetTransform(D2D1::Matrix3x2F::Identity());
-        drawDc->SetDpi(oldDpiX, oldDpiY);
-
-        auto tDrawEnd = std::chrono::high_resolution_clock::now();
-
-        m_renderEngine.EndDraw();
-        m_renderEngine.Present();
-
-        auto tPresentEnd = std::chrono::high_resolution_clock::now();
-
-        // Accumulate per-frame timing (exponential moving average, alpha=0.1).
-        {
-            auto usec = [](auto a, auto b) {
-                return std::chrono::duration<double, std::micro>(b - a).count();
-            };
-            const double a = 0.1;
-            auto& t = m_frameTiming;
-            t.sourcesPrepUs  = t.sourcesPrepUs * (1-a) + usec(tFrameStart, tSourcesEnd) * a;
-            t.evaluateUs     = t.evaluateUs * (1-a) + usec(tSourcesEnd, tEvalEnd) * a;
-            t.deferredComputeUs = t.deferredComputeUs * (1-a) + usec(tEvalEnd, tComputeEnd) * a;
-            t.drawUs         = t.drawUs * (1-a) + usec(tComputeEnd, tDrawEnd) * a;
-            t.presentUs      = t.presentUs * (1-a) + usec(tDrawEnd, tPresentEnd) * a;
-            t.totalUs        = t.totalUs * (1-a) + usec(tFrameStart, tPresentEnd) * a;
-            t.computeDispatches = computeCount;
-            t.framesSampled++;
-            // Snapshot every 30 frames for MCP reads.
-            if (t.framesSampled % 30 == 0)
-                m_lastFrameTiming = t;
-        }
-
-        // Present to any open output windows.
-        PresentOutputWindows();
-
-        // Refresh pixel trace after graph evaluation (before next frame).
-        if (m_traceActive)
-        {
-            PopulatePixelTraceTree();
-            RenderTraceSwatches();
-        }
-        // Update crosshair position each frame (tracks with pan/zoom).
-        UpdateCrosshairOverlay();
-    }
-
     // -----------------------------------------------------------------------
     // Output windows
     // -----------------------------------------------------------------------
@@ -7063,5 +5529,62 @@ namespace winrt::ShaderLab::implementation
             if (it != m_nodeLogs.end())
                 w->Update(it->second);
         }
+    }
+
+    void MainWindow::UpdateFpsTooltip()
+    {
+        // Refresh the TextBlock inside the FPS counter's tooltip with a
+        // fresh per-phase breakdown. The TextBlock's Text property is
+        // observable, so updating it while the tooltip is open re-renders
+        // in place -- giving the user a real-time view of where each
+        // millisecond is going. Sub-phases sum to <= totalUs (= 1000/fps);
+        // the remainder is dispatcher idle / OS overhead between ticks.
+        if (!FpsTooltipText()) return;
+        const auto& ft = m_frameTiming;
+        double fps = m_lastFps;
+        double total = ft.totalUs / 1000.0;
+        double sumPhases =
+            ft.videoTickUs / 1000.0 +
+            ft.sourcesPrepUs / 1000.0 + ft.evaluateUs / 1000.0 +
+            ft.deferredComputeUs / 1000.0 +
+            ft.drawUs / 1000.0 + ft.presentUs / 1000.0 +
+            ft.nodeGraphUs / 1000.0 +
+            ft.outputWindowsUs / 1000.0 +
+            ft.traceUs / 1000.0;
+        double idle = (std::max)(0.0, total - sumPhases);
+
+        std::wstring text = std::format(
+            L"{:.0f} FPS  ({:.1f} ms total)\n"
+            L"\n"
+            L"  video tick    {:>6.2f} ms\n"
+            L"  sources prep  {:>6.2f} ms\n"
+            L"  eval          {:>6.2f} ms\n"
+            L"  compute       {:>6.2f} ms  ({} dispatch{})\n"
+            L"  draw          {:>6.2f} ms\n"
+            L"  present       {:>6.2f} ms\n"
+            L"  node graph    {:>6.2f} ms\n"
+            L"  output wins   {:>6.2f} ms\n"
+            L"  pixel trace   {:>6.2f} ms\n"
+            L"  --------------------------\n"
+            L"  sum           {:>6.2f} ms\n"
+            L"  idle / sched  {:>6.2f} ms",
+            fps, total,
+            ft.videoTickUs / 1000.0,
+            ft.sourcesPrepUs / 1000.0,
+            ft.evaluateUs / 1000.0,
+            ft.deferredComputeUs / 1000.0, ft.computeDispatches,
+                (ft.computeDispatches == 1 ? L"" : L"es"),
+            ft.drawUs / 1000.0,
+            ft.presentUs / 1000.0,
+            ft.nodeGraphUs / 1000.0,
+            ft.outputWindowsUs / 1000.0,
+            ft.traceUs / 1000.0,
+            sumPhases,
+            idle);
+
+        if (m_lastVideoFps > 0.1f)
+            text += std::format(L"\n\n  video decode  {:>6.0f} fps", m_lastVideoFps);
+
+        FpsTooltipText().Text(winrt::hstring(text));
     }
 }

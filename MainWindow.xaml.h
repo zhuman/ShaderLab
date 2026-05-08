@@ -17,7 +17,8 @@
 #include "Controls/LogWindow.h"
 #include "Controls/NodeLog.h"
 #include "EffectDesignerWindow.xaml.h"
-#include "ShaderLab/McpHttpServer.h"
+#include "Engine/Mcp/McpHttpServer.h"
+#include "Engine/Mcp/EngineMcpRoutes.h"
 
 namespace winrt::ShaderLab::implementation
 {
@@ -49,6 +50,11 @@ namespace winrt::ShaderLab::implementation
         void OnGpuInfoTapped(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::TappedRoutedEventArgs const& args);
+
+        // Status-bar broom button (Phase 8 p8-status-bar-button).
+        winrt::fire_and_forget OnReaperBroomClicked(
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Microsoft::UI::Xaml::RoutedEventArgs const& args);
         void OnNodeGraphDragOver(
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::DragEventArgs const& args);
@@ -238,6 +244,8 @@ namespace winrt::ShaderLab::implementation
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer m_renderTimer{ nullptr };
         uint32_t m_frameCount{ 0 };
         uint64_t m_lastVideoUploadCount{ 0 };
+        float    m_lastFps{ 0.0f };
+        float    m_lastVideoFps{ 0.0f };
         std::chrono::steady_clock::time_point m_fpsTimePoint;
         std::chrono::steady_clock::time_point m_lastRenderTick;
 
@@ -252,12 +260,16 @@ namespace winrt::ShaderLab::implementation
 
         // Per-frame performance timings (microseconds, rolling averages).
         struct FrameTimings {
-            double totalUs{};
-            double sourcesPrepUs{};
-            double evaluateUs{};
-            double deferredComputeUs{};
-            double drawUs{};
-            double presentUs{};
+            double totalUs{};            // wall-clock between consecutive timer ticks (true frame interval)
+            double videoTickUs{};        // TickAndUploadLiveCaptures + TickAndUploadVideos + dirty propagation
+            double sourcesPrepUs{};      // PrepareSourceNode loop inside RenderFrame
+            double evaluateUs{};         // GraphEvaluator::Evaluate (passes 1 + 2)
+            double deferredComputeUs{};  // ProcessDeferredCompute (D3D11 compute dispatches) + post-PDC eval
+            double drawUs{};             // swap-chain DrawImage (CPU command queueing)
+            double presentUs{};          // RenderEngine::Present (back-buffer swap, blocks on VSync/GPU)
+            double nodeGraphUs{};        // RenderNodeGraph + overlays (canvas redraw)
+            double outputWindowsUs{};    // PresentOutputWindows (peeled-off output panes)
+            double traceUs{};            // PopulatePixelTraceTree + RenderTraceSwatches
             uint32_t computeDispatches{};
             uint32_t framesSampled{};
         };
@@ -330,6 +342,11 @@ namespace winrt::ShaderLab::implementation
         D2D1_POINT_2F m_graphPanStart{};
         D2D1_POINT_2F m_graphPanOrigin{};
         void UpdatePropertiesPanel();
+        // True when any descendant of PropertiesPanel currently has keyboard
+        // focus (TextBox cursor, NumberBox edit, dropdown open). Used by the
+        // 4 Hz binding-value refresh path to avoid clobbering an in-progress
+        // edit by Clear() + recreate on the panel.
+        bool IsPropertiesPanelInteracting();
         void ShowCurveEditorDialog(uint32_t nodeId, const std::wstring& propertyKey, std::function<void()> markDirty);
         void AddMathExpressionInput(uint32_t nodeId);
         void RemoveMathExpressionInput(uint32_t nodeId, const std::wstring& paramName);
@@ -399,11 +416,44 @@ namespace winrt::ShaderLab::implementation
 
         // MCP HTTP server for AI agent integration.
         std::unique_ptr<::ShaderLab::McpHttpServer> m_mcpServer;
-        bool m_autoStartMcp{ false };
+        // TEMP (Phase 8 perf debugging): default ON so the MCP-driven
+        // graph-building loop doesn't require a manual toggle every
+        // restart. Revert to false once the crash repro is sorted.
+        bool m_autoStartMcp{ true };
         ::ShaderLab::Rendering::DevicePreference m_devicePref{ ::ShaderLab::Rendering::DevicePreference::Default };
         std::wstring m_pendingOpenPath; // file path from Explorer FTA, loaded after init
         void SetupMcpRoutes();
         template<typename F> auto DispatchSync(F&& fn) -> decltype(fn());
+
+        // Phase 7: MainWindow as IEngineCommandSink, hands engine-side
+        // routes a closure that runs on the UI thread (via DispatchSync).
+        // Engine-pure routes that don't need UI thread coordination call
+        // sink.Dispatch with a closure that just reads engine state.
+        // Mutating routes use it to ensure m_graph mutations don't race
+        // with the render tick on the UI thread.
+        struct GuiEngineCommandSink : public ::ShaderLab::Mcp::IEngineCommandSink
+        {
+            MainWindow* window{ nullptr };
+            explicit GuiEngineCommandSink(MainWindow* w) : window(w) {}
+            ::ShaderLab::McpHttpServer::Response Dispatch(
+                std::function<::ShaderLab::McpHttpServer::Response(
+                    ::ShaderLab::Mcp::EngineContext&)> closure) override;
+
+            // ---- Event hooks ---------------------------------------------
+            // Wired to the same UI methods that fire on native user
+            // interactions (toolbar add-node, drag-edge, etc) so MCP-driven
+            // mutations and user-driven mutations take the same code path
+            // through the GUI.
+            void OnNodeAdded(uint32_t /*nodeId*/) override;
+            void OnNodeRemoved(uint32_t nodeId) override;
+            void OnNodeChanged(uint32_t /*nodeId*/) override;
+            void OnGraphCleared() override;
+            void OnGraphLoaded() override;
+            void OnGraphStructureChanged() override;
+            void OnCustomEffectRecompiled(uint32_t nodeId) override;
+            void OnDisplayProfileChanged() override;
+        };
+        std::unique_ptr<GuiEngineCommandSink> m_engineSink;
 
         // MCP activity indicator state.
         // Updated from the MCP listener thread via the activity callback;
@@ -420,6 +470,7 @@ namespace winrt::ShaderLab::implementation
         std::set<std::string> m_mcpKnownPeers;  // distinct peer addresses seen since server start
         void UpdateMcpActivityIndicator();
         void ResetMcpActivityState();
+        void UpdateFpsTooltip();
 
         // Column splitter drag state.
         bool m_isDraggingSplitter{ false };

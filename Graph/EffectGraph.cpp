@@ -23,14 +23,14 @@ namespace ShaderLab::Graph
 
     void EffectGraph::RemoveNode(uint32_t nodeId)
     {
-        // Protect the last Output node — always keep at least one.
-        auto* target = FindNode(nodeId);
-        if (target && target->type == NodeType::Output)
-        {
-            auto outputIds = GetOutputNodeIds();
-            if (outputIds.size() <= 1)
-                return;  // Refuse to delete the last Output node.
-        }
+        // Note: previously this method refused to delete the last Output
+        // node ("always keep at least one"). That protection was removed
+        // because closing an Output node's external window now removes
+        // the node (PresentOutputWindows in MainWindow.xaml.cpp), and
+        // refusing the removal left the graph with a dangling Output
+        // node and no window. The render path tolerates an output-less
+        // graph just fine -- nothing is "needed" so evaluation no-ops
+        // until the user adds a new Output node.
 
         // Remove all edges referencing this node.
         std::erase_if(m_edges, [nodeId](const EffectEdge& e)
@@ -718,6 +718,8 @@ namespace ShaderLab::Graph
                     }
                     if (!p.visibleWhen.empty())
                         po.SetNamedValue(L"visibleWhen", WDJ::JsonValue::CreateStringValue(p.visibleWhen));
+                    if (p.gpuBindable)
+                        po.SetNamedValue(L"gpuBindable", WDJ::JsonValue::CreateBooleanValue(true));
                     params.Append(po);
                 }
                 ced.SetNamedValue(L"parameters", params);
@@ -753,6 +755,8 @@ namespace ShaderLab::Graph
                         fobj.SetNamedValue(L"type", WDJ::JsonValue::CreateStringValue(typeTag));
                         if (AnalysisFieldIsArray(fd.type))
                             fobj.SetNamedValue(L"length", WDJ::JsonValue::CreateNumberValue(fd.arrayLength));
+                        if (fd.gpuPublish)
+                            fobj.SetNamedValue(L"gpuPublish", WDJ::JsonValue::CreateBooleanValue(true));
                         fields.Append(fobj);
                     }
                     ced.SetNamedValue(L"analysisFields", fields);
@@ -961,6 +965,8 @@ namespace ShaderLab::Graph
                     }
                     if (po.HasKey(L"visibleWhen"))
                         pd.visibleWhen = std::wstring(po.GetNamedString(L"visibleWhen"));
+                    if (po.HasKey(L"gpuBindable"))
+                        pd.gpuBindable = po.GetNamedBoolean(L"gpuBindable");
                     def.parameters.push_back(std::move(pd));
                 }
 
@@ -991,6 +997,8 @@ namespace ShaderLab::Graph
                         else if (typeTag == L"float4array") fd.type = AnalysisFieldType::Float4Array;
                         if (fobj.HasKey(L"length"))
                             fd.arrayLength = static_cast<uint32_t>(fobj.GetNamedNumber(L"length"));
+                        if (fobj.HasKey(L"gpuPublish"))
+                            fd.gpuPublish = fobj.GetNamedBoolean(L"gpuPublish");
                         def.analysisFields.push_back(std::move(fd));
                     }
                 }

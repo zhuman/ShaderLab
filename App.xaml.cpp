@@ -637,7 +637,7 @@ namespace winrt::ShaderLab::implementation
 
         // ---- Analysis Effects ----
         LOG("\n=== Analysis Effects ===");
-        { const wchar_t* names[] = { L"Luminance Heatmap", L"Gamut Highlight", L"Nit Map", L"Waveform Monitor" };
+        { const wchar_t* names[] = { L"Luminance Heatmap", L"Gamut Highlight", L"Nit Map" };
           for (auto* name : names) {
             std::string tn = "Analysis_"; for (auto* p = name; *p; ++p) tn += (char)*p;
             try {

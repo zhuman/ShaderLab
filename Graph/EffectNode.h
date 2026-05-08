@@ -39,6 +39,16 @@ namespace ShaderLab::Graph
         // unless the condition is met. Empty = always visible.
         // Supports ==, !=, <, <=, >, >= with numeric comparison.
         std::wstring visibleWhen;
+
+        // GPU-binding eligibility (Phase 8, opt-in). When true, this
+        // parameter's HLSL declaration uses the SHADERLAB_PARAM /
+        // SHADERLAB_LOAD_PARAM macros from `shaderlab_params.hlsli`,
+        // and a property binding from an upstream IEngineComputeOutput
+        // can route the value GPU→GPU. The host injects the
+        // `_SLPARAM_<name>_GPU=0|1` macro at compile time and (when 1)
+        // binds the upstream SRV to the corresponding t-slot.
+        // Default false: parameter is cbuffer-only, current behavior.
+        bool gpuBindable{ false };
     };
 
     // Evaluate a visibleWhen condition against current property values.
@@ -166,6 +176,17 @@ namespace ShaderLab::Graph
         std::wstring name;
         AnalysisFieldType type{ AnalysisFieldType::Float4 };
         uint32_t arrayLength{ 0 };  // only for array types; max 4096 elements
+
+        // GPU-binding publication (Phase 8, opt-in). When true, the
+        // upstream effect implementing IEngineComputeOutput exposes
+        // this field's slot as readable from a downstream
+        // SHADERLAB_GPU_BUFFER binding. The slot index in the
+        // structured-buffer SRV is the field's position in the
+        // analysisFields vector, so the field's order is part of the
+        // binding ABI -- reordering an existing effect's analysisFields
+        // requires bumping its effectVersion.
+        // Default false: field is CPU-only, current behavior.
+        bool gpuPublish{ false };
 
         uint32_t pixelCount() const { return AnalysisFieldPixelCount(type, arrayLength); }
     };

@@ -150,7 +150,13 @@ namespace ShaderLab::Rendering
         // --- D2D Factory ---
         D2D1_FACTORY_OPTIONS d2dOptions{};
 #ifdef _DEBUG
-        d2dOptions.debugLevel = D2D1_DEBUG_LEVEL_INFORMATION;
+        // TEMP (p8c-d2d-debug-layer): D2D debug layer raises a
+        // breakpoint somewhere inside the bridge + binding +
+        // downstream chain combo. Real D2D contract violation that
+        // we haven't pinpointed yet -- masked here so the app stays
+        // alive while the GPU-binding fast path runs. Revert to
+        // INFORMATION once the bug is identified and fixed.
+        d2dOptions.debugLevel = D2D1_DEBUG_LEVEL_NONE;
 #endif
         winrt::check_hresult(
             D2D1CreateFactory(

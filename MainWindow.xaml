@@ -266,7 +266,28 @@
                 <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
 
-            <StackPanel Orientation="Horizontal" Grid.Column="0" Margin="0,0,20,0">
+            <!-- Cache reaper broom (Phase 8 p8-status-bar-button). Click
+                 runs both reapers (graph temps + shader bytecode cache)
+                 and reports freed bytes in the adjacent text block. -->
+            <StackPanel Orientation="Horizontal" Grid.Column="0" Margin="0,0,12,0"
+                        VerticalAlignment="Center">
+                <Button x:Name="ReaperBroomButton"
+                        Click="OnReaperBroomClicked"
+                        Padding="4,2" MinWidth="0" MinHeight="0"
+                        Background="Transparent" BorderThickness="0"
+                        ToolTipService.ToolTip="Sweep cached graph temporaries + shader bytecode (clears stale entries from %LOCALAPPDATA%)">
+                    <FontIcon Glyph="&#xE74D;" FontSize="13"
+                              Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </Button>
+                <TextBlock x:Name="ReaperStatusText"
+                           Text=""
+                           Margin="6,0,0,0"
+                           VerticalAlignment="Center"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Style="{StaticResource CaptionTextBlockStyle}" />
+            </StackPanel>
+
+            <StackPanel Orientation="Horizontal" Grid.Column="1" Margin="0,0,20,0">
                 <FontIcon Glyph="&#xE9D9;" FontSize="11" Margin="0,0,5,0"
                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                 <TextBlock x:Name="PipelineFormatText"
@@ -274,7 +295,7 @@
                            Style="{StaticResource CaptionTextBlockStyle}" />
             </StackPanel>
 
-            <StackPanel Orientation="Horizontal" Grid.Column="1" Margin="0,0,20,0">
+            <StackPanel Orientation="Horizontal" Grid.Column="2" Margin="0,0,20,0">
                 <FontIcon Glyph="&#xE7F4;" FontSize="11" Margin="0,0,5,0"
                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                 <TextBlock x:Name="DisplayModeText"
@@ -282,7 +303,7 @@
                            Style="{StaticResource CaptionTextBlockStyle}" />
             </StackPanel>
 
-            <StackPanel Orientation="Horizontal" Grid.Column="2" Margin="0,0,20,0">
+            <StackPanel Orientation="Horizontal" Grid.Column="3" Margin="0,0,20,0">
                 <FontIcon Glyph="&#xE706;" FontSize="11" Margin="0,0,5,0"
                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                 <TextBlock x:Name="DisplayLuminanceText"
@@ -290,7 +311,7 @@
                            Style="{StaticResource CaptionTextBlockStyle}" />
             </StackPanel>
 
-            <StackPanel Orientation="Horizontal" Grid.Column="3" Margin="0,0,20,0"
+            <StackPanel Orientation="Horizontal" Grid.Column="4" Margin="0,0,20,0"
                         Tapped="OnGpuInfoTapped" Background="Transparent"
                         ToolTipService.ToolTip="Click to change GPU adapter">
                 <FontIcon Glyph="&#xE964;" FontSize="11" Margin="0,0,5,0"
@@ -300,16 +321,19 @@
                            Style="{StaticResource CaptionTextBlockStyle}" />
             </StackPanel>
 
-            <TextBlock x:Name="CursorReadoutText" Grid.Column="4"
-                       Text=""
-                       Margin="0,0,20,0"
-                       Style="{StaticResource CaptionTextBlockStyle}"
-                       FontFamily="Cascadia Mono, Consolas, Courier New" />
-
             <TextBlock x:Name="FpsText" Grid.Column="6"
                        Text="FPS: --"
                        Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                       Style="{StaticResource CaptionTextBlockStyle}" />
+                       Style="{StaticResource CaptionTextBlockStyle}">
+                <ToolTipService.ToolTip>
+                    <ToolTip x:Name="FpsTooltip">
+                        <TextBlock x:Name="FpsTooltipText"
+                                   FontFamily="Cascadia Mono, Consolas, Courier New"
+                                   FontSize="11"
+                                   Text="(no data yet)" />
+                    </ToolTip>
+                </ToolTipService.ToolTip>
+            </TextBlock>
             <TextBlock x:Name="AppVersionText" Grid.Column="7"
                        Visibility="Collapsed" />
         </Grid>
