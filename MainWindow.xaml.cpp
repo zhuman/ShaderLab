@@ -396,6 +396,7 @@ namespace winrt::ShaderLab::implementation
     MainWindow::~MainWindow()
     {
         m_isShuttingDown = true;
+        m_renderShouldStop.store(true, std::memory_order_release);
 
         // Stop MCP server before tearing down resources.
         if (m_mcpServer)
@@ -407,11 +408,22 @@ namespace winrt::ShaderLab::implementation
             m_renderTimer = nullptr;
         }
 
+        // Two-phase shutdown of the render worker:
+        m_renderDispatcher.Shutdown();
+        if (m_renderWorker.joinable())
+        {
+            m_renderWorker.request_stop();
+            m_renderWorker.join();
+        }
+
         m_traceSwapChain = nullptr;
         m_traceSwatchTarget = nullptr;
 
         // Close all output windows.
         m_outputWindows.clear();
+
+        // Release UI-side offscreen wrappers before tearing down render engine.
+        for (auto& b : m_offscreenSourceBitmapUi) b = nullptr;
 
         m_graphEvaluator.ReleaseCache(m_graph);
         m_displayMonitor.Shutdown();
@@ -534,6 +546,7 @@ namespace winrt::ShaderLab::implementation
         RefreshTitleBar();
 
         m_nodeGraphController.SetGraph(&m_graph);
+        m_nodeGraphController.SetDispatcher(&m_renderDispatcher);
         m_nodeGraphController.SetConnectionCallback(
             [this](uint32_t srcId, uint32_t srcPin, uint32_t dstId, uint32_t dstPin, bool isData) {
                 auto* srcNode = m_graph.FindNode(srcId);
@@ -568,6 +581,16 @@ namespace winrt::ShaderLab::implementation
         m_renderTimer.Tick({ this, &MainWindow::OnRenderTick });
         UpdateRenderTimerInterval();
         m_renderTimer.Start();
+
+        // Spawn the render-worker thread (P7 offscreen-render path). Owns
+        // the engine D2D context and runs the graph + GPU loop independently
+        // of the UI thread, drawing into a double-buffered offscreen target.
+        // UI thread blits the latest published buffer into the SwapChainPanel-
+        // bound swap chain in OnRenderTick.
+        m_renderShouldStop.store(false, std::memory_order_release);
+        m_renderWorker = std::jthread([this](std::stop_token stop){
+            this->RenderWorkerLoop(stop);
+        });
 
         // Initialize the node graph editor panel.
         InitializeGraphPanel();
@@ -828,8 +851,18 @@ namespace winrt::ShaderLab::implementation
     void MainWindow::SwitchAdapter(
         ::ShaderLab::Rendering::DevicePreference pref, LUID adapterLuid)
     {
-        // Stop render timer.
+        // Stop UI render timer.
         if (m_renderTimer) m_renderTimer.Stop();
+
+        // Stop the render worker thread before tearing down GPU resources.
+        m_renderShouldStop.store(true, std::memory_order_release);
+        m_renderDispatcher.Wake();
+        if (m_renderWorker.joinable())
+        {
+            m_renderWorker.request_stop();
+            m_renderWorker.join();
+        }
+        m_renderDispatcher.ResetConsumer();
 
         // Save graph + view state.
         auto graphJson = m_graph.ToJson();
@@ -855,6 +888,11 @@ namespace winrt::ShaderLab::implementation
         m_graphGridBrush = nullptr;
         m_traceSwatchTarget = nullptr;
         m_traceSwapChain = nullptr;
+        for (auto& b : m_offscreenSourceBitmapUi) b = nullptr;
+        m_offscreenWrapperWidth = 0;
+        m_offscreenWrapperHeight = 0;
+        m_offscreenPublishedIdx.store(-1, std::memory_order_release);
+        ReleaseUiD2dContext();
         for (auto& w : m_outputWindows) w->Close();
         m_outputWindows.clear();
         for (auto& w : m_logWindows) w->Close();
@@ -966,6 +1004,17 @@ namespace winrt::ShaderLab::implementation
 
         m_forceRender = true;
         UpdateStatusBar();
+
+        // Restart the render worker thread on the new device. SwitchAdapter
+        // stopped+joined it before teardown so it could release engine
+        // resources cleanly; we need to bring it back so the graph evaluates
+        // on the new GPU. Without this, the app appears frozen after a
+        // /gpu/switch -- no clock ticks, no video frames, no Present.
+        m_renderShouldStop.store(false, std::memory_order_release);
+        m_renderWorker = std::jthread([this](std::stop_token stop){
+            this->RenderWorkerLoop(stop);
+        });
+
         // Reopen output windows.
         auto outputIds = m_graph.GetOutputNodeIds();
         for (uint32_t id : outputIds)
@@ -1014,41 +1063,51 @@ namespace winrt::ShaderLab::implementation
             co_return;
 
         auto items = co_await args.DataView().GetStorageItemsAsync();
-        auto* dc = m_renderEngine.D2DDeviceContext();
 
+        // P13 race-fix: AddNode + FindNode + PrepareSourceNode must run on
+        // the render thread so we don't push_back into m_graph.Nodes() while
+        // the worker is mid-iteration. PrepareSourceNode also wants the
+        // render-side D2D context (it creates D2D bitmaps that the
+        // evaluator will consume next tick).
+        std::vector<std::wstring> paths;
         for (const auto& item : items)
         {
-            auto file = item.try_as<winrt::Windows::Storage::StorageFile>();
-            if (!file) continue;
-
-            std::wstring path(file.Path());
-            bool isVideo = ::ShaderLab::Effects::SourceNodeFactory::IsVideoFile(path);
-
-            ::ShaderLab::Graph::EffectNode node;
-            if (isVideo)
-            {
-                node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(path);
-            }
-            else
-            {
-                node = ::ShaderLab::Effects::SourceNodeFactory::CreateImageSourceNode(path);
-            }
-
-            auto id = m_graph.AddNode(std::move(node));
-            m_nodeLogs[id].Info(std::format(L"Dropped: {}", std::filesystem::path(path).filename().wstring()));
-
-            // Prepare the source on the current device.
-            auto* addedNode = m_graph.FindNode(id);
-            if (addedNode && dc)
-            {
-                try {
-                    m_sourceFactory.PrepareSourceNode(*addedNode, dc, 0.0,
-                        m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
-                } catch (...) {}
-            }
+            if (auto file = item.try_as<winrt::Windows::Storage::StorageFile>())
+                paths.emplace_back(std::wstring(file.Path()));
         }
+        if (paths.empty()) co_return;
 
-        m_graph.MarkAllDirty();
+        try {
+            m_renderDispatcher.DispatchSync([this, &paths] {
+                auto* dc = m_renderEngine.RenderD2DContext();
+                for (const auto& path : paths)
+                {
+                    bool isVideo = ::ShaderLab::Effects::SourceNodeFactory::IsVideoFile(path);
+                    ::ShaderLab::Graph::EffectNode node = isVideo
+                        ? ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(path)
+                        : ::ShaderLab::Effects::SourceNodeFactory::CreateImageSourceNode(path);
+
+                    auto id = m_graph.AddNode(std::move(node));
+                    m_nodeLogs[id].Info(std::format(L"Dropped: {}",
+                        std::filesystem::path(path).filename().wstring()));
+
+                    auto* addedNode = m_graph.FindNode(id);
+                    if (addedNode && dc)
+                    {
+                        try {
+                            m_sourceFactory.PrepareSourceNode(*addedNode, dc, 0.0,
+                                m_renderEngine.D3DDevice(), m_renderEngine.D3DContext());
+                        } catch (...) {}
+                    }
+                }
+                m_graph.MarkAllDirty();
+                return 0;
+            });
+        }
+        catch (...) {}
+
+        // AutoLayout + PopulatePreviewNodeSelector touch XAML and
+        // controller state -- UI thread.
         m_nodeGraphController.AutoLayout();
         PopulatePreviewNodeSelector();
         m_forceRender = true;
@@ -1925,9 +1984,6 @@ namespace winrt::ShaderLab::implementation
     {
         if (!m_traceActive) return;
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return;
-
         // Use actual image dimensions in context DIPs for pixel coordinate mapping.
         // DrawImage's sourceRectangle is in the same coordinate space as the D2D context.
         auto bounds = GetPreviewImageBounds();
@@ -1943,8 +1999,22 @@ namespace winrt::ShaderLab::implementation
         uint32_t traceH = static_cast<uint32_t>(imgH);
         if (traceW == 0 || traceH == 0) return;
 
-        if (!m_pixelTrace.ReTrace(dc, m_graph, m_previewNodeId, traceW, traceH))
-            return;
+        // P13: ReTrace walks m_graph + reads pixel values from each node's
+        // cachedOutput via DrawImage to a 1x1 staging texture. m_graph is
+        // single-writer/single-reader on the render thread; doing this on
+        // the UI thread races with the worker's evaluate. Dispatch to the
+        // render thread so the trace runs while m_graph is stable, then
+        // resume on the UI thread to update the XAML tree.
+        bool ok = false;
+        try {
+            ok = m_renderDispatcher.DispatchSync([this, traceW, traceH]() {
+                auto* renderDc = m_renderEngine.RenderD2DContext();
+                if (!renderDc) return false;
+                return m_pixelTrace.ReTrace(renderDc, m_graph, m_previewNodeId, traceW, traceH);
+            });
+        }
+        catch (...) { ok = false; }
+        if (!ok) return;
 
         auto topoHash = HashTraceTopology(m_pixelTrace.Root());
         if (topoHash == m_lastTraceTopologyHash)
@@ -2092,10 +2162,52 @@ namespace winrt::ShaderLab::implementation
     // Node graph editor rendering
     // -----------------------------------------------------------------------
 
+    void MainWindow::EnsureUiD2dContext()
+    {
+        if (m_uiD2dContext) return;
+        if (!m_renderEngine.D2DDevice()) return;
+
+        // P7: create the UI-side D2D context from the SAME multi-threaded D2D
+        // device the render engine uses. Two contexts on the same device share
+        // resources without explicit sync, so the offscreen texture written
+        // by the render-thread context is immediately visible to the UI-thread
+        // context's DrawImage. Two SEPARATE D2D devices (the original P4
+        // approach) would need keyed-mutex / shared-handle sync to avoid
+        // sampling stale GPU writes -- which manifested as a black preview
+        // pane after the worker spawn (every published frame's pixels were
+        // still in flight on the render device).
+        m_uiD2dFactory = nullptr; // we won't own a factory anymore
+        m_uiD2dDevice.copy_from(m_renderEngine.D2DDevice());
+        if (FAILED(m_uiD2dDevice->CreateDeviceContext(
+                D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                m_uiD2dContext.put())))
+        {
+            m_uiD2dContext = nullptr;
+            m_uiD2dDevice = nullptr;
+            return;
+        }
+    }
+
+    void MainWindow::ReleaseUiD2dContext()
+    {
+        // Brushes and bitmap targets are device-context-bound. When the UI
+        // context goes away (e.g. adapter switch) they have to be released
+        // before recreating the context against the new device.
+        m_graphGridBrush = nullptr;
+        m_graphRenderTarget = nullptr;
+        m_traceSwatchTarget = nullptr;
+        m_uiD2dContext = nullptr;
+        m_uiD2dDevice = nullptr;
+        m_uiD2dFactory = nullptr;
+    }
+
     void MainWindow::InitializeGraphPanel()
     {
         if (!m_renderEngine.DXGIFactory() || !m_renderEngine.D3DDevice())
             return;
+
+        EnsureUiD2dContext();
+        if (!m_uiD2dContext) return;
 
         auto panel = NodeGraphPanel();
         m_graphPanelDipsWidth = (std::max)(1.0f, static_cast<float>(panel.ActualWidth()));
@@ -2134,8 +2246,11 @@ namespace winrt::ShaderLab::implementation
         panelNative->SetSwapChain(m_graphSwapChain.get());
         UpdateGraphPanelScale();
 
-        // Create render target.
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        // Create render target on the UI-side D2D context (NOT the render
+        // engine's). Once the render thread (Phase 7) owns the engine
+        // context exclusively, this swap-chain target keeps drawing on the
+        // UI thread without crossing the multithread fence.
+        auto* dc = m_uiD2dContext.get();
         winrt::com_ptr<IDXGISurface> surface;
         m_graphSwapChain->GetBuffer(0, IID_PPV_ARGS(surface.put()));
 
@@ -2174,7 +2289,7 @@ namespace winrt::ShaderLab::implementation
         m_graphRenderTarget = nullptr;
         m_graphSwapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        auto* dc = m_uiD2dContext.get();
         if (!dc) return;
 
         winrt::com_ptr<IDXGISurface> surface;
@@ -2209,8 +2324,12 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::InitializeTraceSwatchPanel()
     {
-        if (m_traceSwapChain || !m_renderEngine.DXGIFactory() || !m_renderEngine.D3DDevice())
+        if (m_traceSwapChain) return;
+        if (!m_renderEngine.DXGIFactory() || !m_renderEngine.D3DDevice())
             return;
+
+        EnsureUiD2dContext();
+        if (!m_uiD2dContext) return;
 
         auto panel = TraceSwatchPanel();
         float scaleX = (std::max)(1.0f, static_cast<float>(panel.CompositionScaleX()));
@@ -2277,9 +2396,7 @@ namespace winrt::ShaderLab::implementation
         m_traceSwatchTarget = nullptr;
         m_traceSwapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return;
-
+        auto* dc = m_uiD2dContext.get();
         winrt::com_ptr<IDXGISurface> surface;
         m_traceSwapChain->GetBuffer(0, IID_PPV_ARGS(surface.put()));
 
@@ -2318,7 +2435,9 @@ namespace winrt::ShaderLab::implementation
         if (!m_traceSwapChain || !m_traceSwatchTarget)
             return;
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        // Use the UI-side D2D context -- editor / trace canvas drawing must
+        // not share state with the render engine's evaluator context.
+        auto* dc = m_uiD2dContext.get();
         if (!dc) return;
 
         winrt::com_ptr<ID2D1Image> oldTarget;
@@ -2366,8 +2485,7 @@ namespace winrt::ShaderLab::implementation
         drawSwatches(m_pixelTrace.Root(), 0);
 
         dc->EndDraw();
-        dc->SetTarget(oldTarget.get());
-        dc->SetDpi(oldDpiX, oldDpiY);
+        dc->SetTarget(nullptr);
 
         m_traceSwapChain->Present(0, 0);
     }
@@ -2412,14 +2530,11 @@ namespace winrt::ShaderLab::implementation
         if (!m_nodeGraphController.NeedsRedraw())
             return;
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        // UI-side D2D context: editor canvas is rendered entirely on the UI
+        // thread, separately from the render thread's evaluator context.
+        auto* dc = m_uiD2dContext.get();
         if (!dc) return;
 
-        winrt::com_ptr<ID2D1Image> oldTarget;
-        dc->GetTarget(oldTarget.put());
-
-        float oldDpiX, oldDpiY;
-        dc->GetDpi(&oldDpiX, &oldDpiY);
         float graphDpiX = 96.0f * (std::max)(1.0f, static_cast<float>(NodeGraphPanel().CompositionScaleX()));
         float graphDpiY = 96.0f * (std::max)(1.0f, static_cast<float>(NodeGraphPanel().CompositionScaleY()));
         dc->SetDpi(graphDpiX, graphDpiY);
@@ -2431,9 +2546,7 @@ namespace winrt::ShaderLab::implementation
         RenderGraphScene(dc, viewSize);
 
         dc->EndDraw();
-        dc->SetTarget(oldTarget.get());
-
-        dc->SetDpi(oldDpiX, oldDpiY);
+        dc->SetTarget(nullptr);
 
         m_graphSwapChain->Present(0, 0);
     }
@@ -2772,6 +2885,21 @@ namespace winrt::ShaderLab::implementation
 
         auto* node = m_graph.FindNode(m_selectedNodeId);
         if (!node) return;
+
+        // For *displayed* runtime fields (runtimeError, analysisOutput), read
+        // from the published snapshot when available -- these fields are
+        // written by the evaluator and would race direct m_graph reads once
+        // the render thread spawns. The snapshot is a value copy of the
+        // graph state at the last frame boundary. We keep a local copy of
+        // the shared_ptr so the snapshot stays alive for the duration of
+        // this method (the panel is rebuilt synchronously here).
+        // Mutating reads (name change, property change, etc.) still operate
+        // on the live `node` pointer because their writes must hit the live
+        // graph through the dispatcher.
+        auto graphSnapshot = CurrentGraphSnapshot();
+        const ::ShaderLab::Graph::EffectNode* snapNode =
+            graphSnapshot ? graphSnapshot->FindNode(m_selectedNodeId) : nullptr;
+        const ::ShaderLab::Graph::EffectNode* readNode = snapNode ? snapNode : node;
 
         uint32_t capturedId = m_selectedNodeId;
 
@@ -3465,13 +3593,22 @@ namespace winrt::ShaderLab::implementation
                     if (hasVisibleWhen || isParameterNode || (n && n->effectClsid.has_value() &&
                         IsEqualGUID(n->effectClsid.value(), CLSID_D2D1Histogram)))
                     {
+                        // Normal priority (was Low) so the panel + node-graph
+                        // rebuild doesn't get starved behind the 60 Hz UI tick
+                        // when the user flips a visibleWhen trigger. With Low
+                        // priority the rebuild could sit in the queue
+                        // indefinitely on a busy render path -- the user sees
+                        // the Properties panel reflect their change but the
+                        // canvas pins don't materialize.
                         this->DispatcherQueue().TryEnqueue(
-                            winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low,
+                            winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Normal,
                             [this]() {
                                 if (!m_isShuttingDown)
                                 {
                                     UpdatePropertiesPanel();
                                     m_nodeGraphController.RebuildLayout();
+                                    m_nodeGraphController.SetNeedsRedraw();
+                                    m_forceRender = true;
                                 }
                             });
                     }
@@ -4071,11 +4208,11 @@ namespace winrt::ShaderLab::implementation
         }
 
         // ---- Analysis output visualization ----
-        if (node->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Histogram &&
-            !node->analysisOutput.data.empty())
+        if (readNode->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Histogram &&
+            !readNode->analysisOutput.data.empty())
         {
             auto histHeader = Controls::TextBlock();
-            histHeader.Text(winrt::hstring(node->analysisOutput.label));
+            histHeader.Text(winrt::hstring(readNode->analysisOutput.label));
             histHeader.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
             histHeader.Margin({ 0, 8, 0, 4 });
             panel.Children().Append(histHeader);
@@ -4089,7 +4226,7 @@ namespace winrt::ShaderLab::implementation
             canvas.Background(Media::SolidColorBrush(
                 winrt::Windows::UI::Color{ 255, 30, 30, 30 }));
 
-            const auto& bins = node->analysisOutput.data;
+            const auto& bins = readNode->analysisOutput.data;
             uint32_t numBins = static_cast<uint32_t>(bins.size());
             if (numBins > 0)
             {
@@ -4099,7 +4236,7 @@ namespace winrt::ShaderLab::implementation
 
                 // Choose bar color based on channel.
                 winrt::Windows::UI::Color barColor;
-                switch (node->analysisOutput.channelIndex)
+                switch (readNode->analysisOutput.channelIndex)
                 {
                 case 0: barColor = { 200, 255, 60, 60 }; break;   // Red
                 case 1: barColor = { 200, 60, 255, 60 }; break;   // Green
@@ -4128,8 +4265,8 @@ namespace winrt::ShaderLab::implementation
         }
 
         // ---- Typed analysis output ----
-        if (node->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Typed &&
-            !node->analysisOutput.fields.empty())
+        if (readNode->analysisOutput.type == ::ShaderLab::Graph::AnalysisOutputType::Typed &&
+            !readNode->analysisOutput.fields.empty())
         {
             auto analysisHeader = Controls::TextBlock();
             analysisHeader.Text(L"Analysis Results");
@@ -4137,7 +4274,7 @@ namespace winrt::ShaderLab::implementation
             analysisHeader.Margin({ 0, 8, 0, 4 });
             panel.Children().Append(analysisHeader);
 
-            for (const auto& fv : node->analysisOutput.fields)
+            for (const auto& fv : readNode->analysisOutput.fields)
             {
                 auto row = Controls::StackPanel();
                 row.Orientation(Controls::Orientation::Horizontal);
@@ -4892,7 +5029,11 @@ namespace winrt::ShaderLab::implementation
 
     std::vector<uint8_t> MainWindow::CaptureImageAsPng(ID2D1Image* image, uint32_t maxDim)
     {
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        // Use the render-thread D2D context (the same one the worker uses
+        // for BeginDraw), since this is called from inside the render
+        // dispatcher's closure. Avoids cross-context state issues with the
+        // default context that output windows + UI capture paths use.
+        auto* dc = m_renderEngine.RenderD2DContext();
         if (!dc || !image) return {};
 
         // Use 96 DPI so GetImageLocalBounds returns pixel coordinates.
@@ -5046,7 +5187,10 @@ namespace winrt::ShaderLab::implementation
 
     std::vector<uint8_t> MainWindow::CaptureGraphAsPng()
     {
-        auto* dc = m_renderEngine.D2DDeviceContext();
+        // Use the UI-side D2D context -- this draws the editor canvas and
+        // produces a CPU-readable bitmap purely on the UI thread, with no
+        // dependency on the render-engine D2D context.
+        auto* dc = m_uiD2dContext.get();
         if (!dc) return {};
 
         // Layout may be stale (e.g., after MCP set-property) — rebuild before
@@ -5419,11 +5563,28 @@ namespace winrt::ShaderLab::implementation
             node->name,
             m_renderEngine.ActiveFormat());
 
+        // P7: register the cross-thread sink with the worker. The shared_ptr
+        // keeps the OutputSinkRenderState alive across thread boundaries
+        // even if the user closes the window mid-render-frame.
+        if (auto sink = window->Sink())
+        {
+            std::scoped_lock lock(m_outputSinksMutex);
+            m_outputSinks.push_back(sink);
+        }
+
         m_outputWindows.push_back(std::move(window));
     }
 
     void MainWindow::CloseOutputWindow(uint32_t nodeId)
     {
+        // P7: remove the corresponding sink first so the worker stops
+        // rendering into its buffers BEFORE the OutputWindow tears down its
+        // swap chain. Sink->closed is also set by OutputWindow::Close.
+        {
+            std::scoped_lock lock(m_outputSinksMutex);
+            std::erase_if(m_outputSinks,
+                [nodeId](const auto& s){ return s && s->nodeId == nodeId; });
+        }
         std::erase_if(m_outputWindows, [nodeId](const auto& w)
         {
             return w->NodeId() == nodeId;
@@ -5432,15 +5593,28 @@ namespace winrt::ShaderLab::implementation
 
     void MainWindow::PresentOutputWindows()
     {
+        // P7: UI-thread tick for output windows. Sync each window's view
+        // state into its sink, then blit the latest worker-published frame.
+        // The actual render-into-offscreen happens on the worker thread in
+        // RenderOutputSinks (called from RenderFrameToOffscreen).
         if (m_outputWindows.empty())
             return;
 
-        // Remove closed windows and their corresponding graph nodes.
+        // Remove closed windows and their corresponding graph nodes (and
+        // their sinks).
         std::vector<uint32_t> closedNodeIds;
         std::erase_if(m_outputWindows, [&closedNodeIds](const auto& w) {
             if (!w->IsOpen()) { closedNodeIds.push_back(w->NodeId()); return true; }
             return false;
         });
+        if (!closedNodeIds.empty())
+        {
+            std::scoped_lock lock(m_outputSinksMutex);
+            std::erase_if(m_outputSinks, [&closedNodeIds](const auto& s){
+                return !s || std::find(closedNodeIds.begin(), closedNodeIds.end(),
+                    s->nodeId) != closedNodeIds.end();
+            });
+        }
         for (uint32_t nodeId : closedNodeIds)
         {
             m_graph.RemoveNode(nodeId);
@@ -5458,36 +5632,29 @@ namespace winrt::ShaderLab::implementation
         }
         if (!closedNodeIds.empty())
         {
-            // Force the next render tick so the graph panel repaints without
-            // the deleted Output node (otherwise the tick gate would skip
-            // rendering since no nodes are dirty and m_outputWindows is now
-            // smaller/empty).
             m_forceRender = true;
             m_nodeGraphController.SetNeedsRedraw();
             MarkUnsaved();
         }
 
-        auto* dc = m_renderEngine.D2DDeviceContext();
-        if (!dc) return;
-
-        auto& ft = m_frameTiming;
-        std::wstring timingStr = std::format(L"{:.1f}ms (eval {:.1f} + compute {:.1f} + draw {:.1f})",
-            ft.totalUs / 1000.0, ft.evaluateUs / 1000.0,
-            ft.deferredComputeUs / 1000.0, ft.drawUs / 1000.0 + ft.presentUs / 1000.0);
+        // Canonical status string + tooltip pushed to every output window.
+        std::wstring statusText  = BuildFpsStatusText();
+        std::wstring tooltipText = BuildFpsTooltipText();
 
         for (auto& window : m_outputWindows)
         {
             if (!window->IsReady())
                 continue;
 
-            // Sync window title with node name.
             auto* node = m_graph.FindNode(window->NodeId());
             if (node)
                 window->SetTitle(node->name);
-            window->SetTimingText(timingStr);
+            window->SetStatusText(statusText);
+            window->SetStatusTooltip(tooltipText);
 
-            auto* image = ResolveDisplayImage(window->NodeId());
-            window->Present(dc, image);
+            // P7: push UI view state, then blit latest worker frame.
+            window->SyncSinkFromUi();
+            window->BlitAndPresent(m_uiD2dContext.get());
         }
     }
 
@@ -5531,6 +5698,67 @@ namespace winrt::ShaderLab::implementation
         }
     }
 
+    std::wstring MainWindow::BuildFpsTooltipText() const
+    {
+        // Builds the multi-line per-phase breakdown shown in the FPS tooltip.
+        // Split into "Graph eval" (the actual cost of one render-thread frame
+        // -- the meaningful number for HDR shader / tonemap perf evaluation,
+        // which is the primary purpose of this app) and "UI overhead" (the
+        // SwapChain blit + Present1 vsync wait + canvas redraw on the UI
+        // tick). FPS and total-ms reflect graph-eval throughput only.
+        const auto& ft = m_frameTiming;
+        double fps = m_lastFps;
+        double total = ft.totalUs / 1000.0;
+        double sumGraph =
+            ft.sourcesPrepUs / 1000.0 + ft.evaluateUs / 1000.0 +
+            ft.deferredComputeUs / 1000.0 +
+            ft.drawUs / 1000.0 + ft.endDrawFlushUs / 1000.0;
+        double idle = (std::max)(0.0, total - sumGraph);
+
+        std::wstring text = std::format(
+            L"{:.0f} FPS  ({:.1f} ms / graph eval)\n"
+            L"\n"
+            L"  Graph eval (render thread):\n"
+            L"    sources prep    {:>6.2f} ms\n"
+            L"    eval            {:>6.2f} ms\n"
+            L"    compute         {:>6.2f} ms  ({} dispatch{})\n"
+            L"    draw            {:>6.2f} ms\n"
+            L"    end-draw flush  {:>6.2f} ms\n"
+            L"    -----------------------------\n"
+            L"    sum             {:>6.2f} ms\n"
+            L"    idle / sched    {:>6.2f} ms\n"
+            L"\n"
+            L"  UI overhead (UI thread, not in totals):\n"
+            L"    ui tick         {:>6.2f} ms  (drain + blit + Present1 + canvas)\n"
+            L"    output windows  {:>6.2f} ms\n"
+            L"    pixel trace     {:>6.2f} ms",
+            fps, total,
+            ft.sourcesPrepUs / 1000.0,
+            ft.evaluateUs / 1000.0,
+            ft.deferredComputeUs / 1000.0, ft.computeDispatches,
+                (ft.computeDispatches == 1 ? L"" : L"es"),
+            ft.drawUs / 1000.0,
+            ft.endDrawFlushUs / 1000.0,
+            sumGraph,
+            idle,
+            ft.uiTickUs / 1000.0,
+            ft.outputWindowsUs / 1000.0,
+            ft.traceUs / 1000.0);
+
+        if (m_lastVideoFps > 0.1f)
+            text += std::format(L"\n\n  video decode    {:>6.0f} fps", m_lastVideoFps);
+
+        return text;
+    }
+
+    std::wstring MainWindow::BuildFpsStatusText() const
+    {
+        // Single-line "60 fps | 16.5 ms" canonical status string. Shared by
+        // the main FPS counter and every output window's status bar.
+        return std::format(L"{:.0f} fps | {:.1f} ms",
+            m_lastFps, m_frameTiming.totalUs / 1000.0);
+    }
+
     void MainWindow::UpdateFpsTooltip()
     {
         // Refresh the TextBlock inside the FPS counter's tooltip with a
@@ -5540,51 +5768,6 @@ namespace winrt::ShaderLab::implementation
         // millisecond is going. Sub-phases sum to <= totalUs (= 1000/fps);
         // the remainder is dispatcher idle / OS overhead between ticks.
         if (!FpsTooltipText()) return;
-        const auto& ft = m_frameTiming;
-        double fps = m_lastFps;
-        double total = ft.totalUs / 1000.0;
-        double sumPhases =
-            ft.videoTickUs / 1000.0 +
-            ft.sourcesPrepUs / 1000.0 + ft.evaluateUs / 1000.0 +
-            ft.deferredComputeUs / 1000.0 +
-            ft.drawUs / 1000.0 + ft.presentUs / 1000.0 +
-            ft.nodeGraphUs / 1000.0 +
-            ft.outputWindowsUs / 1000.0 +
-            ft.traceUs / 1000.0;
-        double idle = (std::max)(0.0, total - sumPhases);
-
-        std::wstring text = std::format(
-            L"{:.0f} FPS  ({:.1f} ms total)\n"
-            L"\n"
-            L"  video tick    {:>6.2f} ms\n"
-            L"  sources prep  {:>6.2f} ms\n"
-            L"  eval          {:>6.2f} ms\n"
-            L"  compute       {:>6.2f} ms  ({} dispatch{})\n"
-            L"  draw          {:>6.2f} ms\n"
-            L"  present       {:>6.2f} ms\n"
-            L"  node graph    {:>6.2f} ms\n"
-            L"  output wins   {:>6.2f} ms\n"
-            L"  pixel trace   {:>6.2f} ms\n"
-            L"  --------------------------\n"
-            L"  sum           {:>6.2f} ms\n"
-            L"  idle / sched  {:>6.2f} ms",
-            fps, total,
-            ft.videoTickUs / 1000.0,
-            ft.sourcesPrepUs / 1000.0,
-            ft.evaluateUs / 1000.0,
-            ft.deferredComputeUs / 1000.0, ft.computeDispatches,
-                (ft.computeDispatches == 1 ? L"" : L"es"),
-            ft.drawUs / 1000.0,
-            ft.presentUs / 1000.0,
-            ft.nodeGraphUs / 1000.0,
-            ft.outputWindowsUs / 1000.0,
-            ft.traceUs / 1000.0,
-            sumPhases,
-            idle);
-
-        if (m_lastVideoFps > 0.1f)
-            text += std::format(L"\n\n  video decode  {:>6.0f} fps", m_lastVideoFps);
-
-        FpsTooltipText().Text(winrt::hstring(text));
+        FpsTooltipText().Text(winrt::hstring(BuildFpsTooltipText()));
     }
 }

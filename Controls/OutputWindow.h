@@ -2,6 +2,7 @@
 
 #include "pch.h"
 #include "../Rendering/PipelineFormat.h"
+#include "OutputSinkRenderState.h"
 
 namespace ShaderLab::Controls
 {
@@ -24,14 +25,45 @@ namespace ShaderLab::Controls
             const std::wstring& nodeName,
             const Rendering::PipelineFormat& format);
 
+        // Legacy single-thread present path. Retained for compatibility but
+        // unused after P7; the new path is SyncSinkFromUi (UI) +
+        // RenderOutputSink (render thread, free function in RenderTick) +
+        // BlitAndPresent (UI). Will be removed when all call sites migrate.
         void Present(ID2D1DeviceContext5* dc, ID2D1Image* image);
+
+        // P7: push current UI-thread view state (window size, pan/zoom,
+        // autoFit, needsFit) into the shared sink under its viewMutex so
+        // the render thread can read a coherent snapshot. Called once per
+        // UI tick before BlitAndPresent.
+        void SyncSinkFromUi();
+
+        // P7: blit the latest published offscreen buffer (created on render
+        // thread, see RenderOutputSink in MainWindow.RenderTick.cpp) into
+        // this window's swap chain back buffer, then Present1. UI thread
+        // only. Lazily rebuilds the UI-side D2D bitmap source wrappers if
+        // the render thread bumped bufferGen since last blit.
+        void BlitAndPresent(ID2D1DeviceContext5* uiDc);
+
+        // P7 sink accessor. Lifetime is shared_ptr so the render thread can
+        // hold a reference for the duration of one frame even if the UI
+        // thread closes the window mid-render.
+        std::shared_ptr<OutputSinkRenderState> Sink() const { return m_sink; }
+
         void Close();
 
         bool IsOpen() const { return m_isOpen; }
         bool IsReady() const { return m_swapChain != nullptr; }
         uint32_t NodeId() const { return m_nodeId; }
         void SetTitle(const std::wstring& title);
-        void SetTimingText(const std::wstring& text);
+        // Push the canonical "NN fps | NN.N ms" status string from the main
+        // window. Each render tick presents to all output windows
+        // synchronously, so the main window's FPS *is* this window's FPS --
+        // no point recomputing it per-window.
+        void SetStatusText(const std::wstring& text);
+        // Push the multi-line per-phase breakdown the main window shows in
+        // its FPS-tooltip flyout. Used as the hover tooltip on this
+        // window's status bar.
+        void SetStatusTooltip(const std::wstring& tooltip);
 
     private:
         void CreateSwapChain();
@@ -57,6 +89,10 @@ namespace ShaderLab::Controls
         winrt::com_ptr<IDXGISwapChain3> m_swapChain;
         winrt::com_ptr<ID2D1Bitmap1> m_renderTarget;
 
+        // P7 cross-thread state. Created in Create(), shared with the
+        // render worker via MainWindow::m_outputSinks.
+        std::shared_ptr<OutputSinkRenderState> m_sink;
+
         // Last rendered image (non-owning, for save).
         ID2D1Image* m_lastImage{ nullptr };
         std::wstring m_nodeName;
@@ -80,10 +116,9 @@ namespace ShaderLab::Controls
         float m_panOriginX{ 0.0f };
         float m_panOriginY{ 0.0f };
 
-        // FPS counter.
-        uint32_t m_frameCount{ 0 };
-        std::chrono::steady_clock::time_point m_fpsTime;
-        std::wstring m_timingText;
+        // FPS counter -- driven by main window via SetStatusText/SetStatusTooltip.
+        // No per-window state; every render tick presents to all output windows
+        // synchronously so the main window's FPS *is* this window's FPS.
 
         // Event tokens for cleanup.
         winrt::event_token m_sizeChangedToken{};

@@ -118,6 +118,7 @@
   <ItemGroup>
     <ClInclude Include="Controls\NodeGraphController.h" />
     <ClInclude Include="Controls\OutputWindow.h" />
+    <ClInclude Include="Controls\OutputSinkRenderState.h" />
     <ClInclude Include="Controls\NodeLog.h" />
     <ClInclude Include="Controls\LogWindow.h" />
     <ClInclude Include="Controls\PixelInspectorController.h" />
@@ -154,7 +155,6 @@
     <ClInclude Include="Rendering\DisplayMonitor.h" />
     <ClInclude Include="Rendering\DisplayProfile.h" />
     <ClInclude Include="Rendering\GraphEvaluator.h" />
-    <ClInclude Include="Rendering\D3D11ComputeRunner.h" />
     <ClInclude Include="Rendering\D3D11ComputeRunner.h" />
     <ClInclude Include="Rendering\IccProfileParser.h" />
     <ClInclude Include="Rendering\PipelineFormat.h" />
@@ -319,7 +319,6 @@
     <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('packages\Microsoft.Windows.CppWinRT.2.0.250303.1\build\native\Microsoft.Windows.CppWinRT.targets')" />
     <Import Project="packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets" Condition="Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" />
     <Import Project="packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets" Condition="Exists('packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets')" />
-    <Import Project="packages\Microsoft.Graphics.Win2D.1.3.0\build\native\Microsoft.Graphics.Win2D.targets" Condition="Exists('packages\Microsoft.Graphics.Win2D.1.3.0\build\native\Microsoft.Graphics.Win2D.targets')" />
   </ImportGroup>
   <!--
     Copy ShaderLabEngine.dll into the app output and include it in the MSIX package payload.
@@ -369,7 +368,6 @@
     <Error Condition="!Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.props'))" />
     <Error Condition="!Exists('packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.SDK.BuildTools.10.0.26100.7705\build\Microsoft.Windows.SDK.BuildTools.targets'))" />
     <Error Condition="!Exists('packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Windows.ImplementationLibrary.1.0.260126.7\build\native\Microsoft.Windows.ImplementationLibrary.targets'))" />
-    <Error Condition="!Exists('packages\Microsoft.Graphics.Win2D.1.3.0\build\native\Microsoft.Graphics.Win2D.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\Microsoft.Graphics.Win2D.1.3.0\build\native\Microsoft.Graphics.Win2D.targets'))" />
   </Target>
   <!--
     Auto-generates a local self-signed code-signing certificate so a fresh `git clone` can F5 immediately.

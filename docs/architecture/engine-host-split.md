@@ -12,10 +12,12 @@ The codebase is divided between a host-agnostic engine DLL and one or more host 
 
 When MCP routes mutate engine state, they fire through an `IEngineCommandSink` (`Engine/Mcp/EngineMcpRoutes.h`) so that:
 
-1. The host marshals the mutation closure to whatever thread is appropriate (UI thread for the GUI app via `DispatcherQueue`; synchronous direct-call for headless).
-2. The host runs **event hooks** afterwards on the same thread to keep its UI / output windows / preview selector in sync.
+1. The host marshals the mutation closure to whatever thread is appropriate. The GUI host routes to the **render worker thread** via `RenderThreadDispatcher::DispatchSync` (P7+) so `m_graph` stays single-writer; the headless host runs the closure inline since there is no separate consumer.
+2. The host runs **event hooks** afterwards. Hooks may need to touch XAML (which is STA-only), so the GUI sink re-marshals UI work back to the UI thread via `DispatcherQueue().TryEnqueue` from inside the render-thread closure.
 
 The eight hooks are: `OnNodeAdded`, `OnNodeRemoved`, `OnNodeChanged`, `OnGraphCleared`, `OnGraphLoaded`, `OnGraphStructureChanged`, `OnCustomEffectRecompiled`, `OnDisplayProfileChanged`. The GUI's `MainWindow::GuiEngineCommandSink` overrides each one to call the same UI methods that handle native user interactions (`AutoLayout`, `RebuildLayout`, `PopulatePreviewNodeSelector`, `PopulateAddNodeFlyout`, `UpdateStatusBar`, `MarkAllDirty`, `CloseOutputWindow`, `ResetAfterGraphLoad`). The headless host leaves each hook as the default no-op. **Result: an MCP client calling `/graph/add-node` triggers exactly the same downstream UI code path as the user clicking the toolbar.**
+
+See [Threading Model](threading-model.md) for the full UI / render-worker split and the offscreen-blit composition path.
 
 The 16 routes that remain in `MainWindow.McpRoutes.cpp` are intentionally app-side because they are either UI-coupled (`/graph/snapshot`, `/graph/view*`, `/preview/view*`, `/render/preview-node`, `/render/capture`, `/render/pixel-trace`) or host-specific (`/`, `POST /` JSON-RPC dispatcher, `/context`, `/perf`, `/node/<id>/logs`, `/render/pixel/<x>/<y>`).
 

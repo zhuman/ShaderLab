@@ -3,6 +3,7 @@
 #include "pch.h"
 #include "../Graph/EffectGraph.h"
 #include "../Effects/EffectRegistry.h"
+#include "../Rendering/RenderThreadDispatcher.h"
 
 namespace ShaderLab::Controls
 {
@@ -73,6 +74,15 @@ namespace ShaderLab::Controls
 
         // Bind to an effect graph. Must be called before any interaction.
         void SetGraph(Graph::EffectGraph* graph);
+
+        // Bind the render-thread dispatcher. All graph-mutating calls
+        // (Connect/Disconnect/AddNode/RemoveNode/BindProperty etc.) route
+        // through this so they execute on whichever thread owns rendering.
+        // Until the worker thread spawns (Phase 7), the dispatcher runs in
+        // synchronous mode and closures execute inline -- equivalent to
+        // calling m_graph->X() directly. Setting nullptr falls back to the
+        // direct-call path (e.g. tests that don't have a dispatcher).
+        void SetDispatcher(::ShaderLab::Rendering::RenderThreadDispatcher* d) { m_dispatcher = d; }
 
         // ---- Layout ----
 
@@ -211,6 +221,7 @@ namespace ShaderLab::Controls
         static D2D1_COLOR_F NodeHeaderColor(Graph::NodeType type);
 
         Graph::EffectGraph* m_graph{ nullptr };
+        ::ShaderLab::Rendering::RenderThreadDispatcher* m_dispatcher{ nullptr };
         ConnectionCallback m_connectionCallback;
 
         // Cached visual layout.

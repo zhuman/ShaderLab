@@ -87,6 +87,29 @@ namespace ShaderLab::Rendering
         // Effects created on the previous frame are now fully initialized.
         m_justCreated.clear();
 
+        // NOTE on deferred-compute ownership:
+        //   `DeferredCompute::inputImages` holds owning `winrt::com_ptr<ID2D1Image>`
+        //   entries (not raw pointers), so even if a subsequent Evaluate
+        //   pass within the same render iteration rebuilds the producing
+        //   effect, this pass's entry keeps the image chain alive. We do
+        //   NOT clear m_deferredCompute here.
+        //
+        //   We used to clear at the top of Evaluate to prevent a UAF from
+        //   stale raw pointers across a two-pass render iteration. With
+        //   owning refs in place, that defence is moot -- and clearing here
+        //   actually breaks the steady-state flow: pass 1 pushes a deferred
+        //   entry while the node is dirty + fields are stale, pass 2 finds
+        //   `dirty=false` and `analysisOutput.fields` already populated
+        //   from a previous runEval, so it does NOT re-push. Clearing
+        //   between the passes then leaves m_deferredCompute empty and
+        //   ProcessDeferredCompute dispatches nothing -- set-property on
+        //   an upstream Source has no visible effect on a downstream
+        //   compute analysis node.
+        //
+        //   m_deferredCompute is drained + cleared at the bottom of
+        //   ProcessDeferredCompute; the source-not-ready early return
+        //   above (in ProcessDeferredCompute) also clears it.
+
         // Get topological ordering (sources first → output last).
         std::vector<uint32_t> order;
         try
@@ -231,12 +254,35 @@ namespace ShaderLab::Rendering
                     }
 
                     auto inputs = graph.GetInputEdges(nodeId);
-                    ID2D1Image* inputImage = nullptr;
-                    if (!inputs.empty())
+                    // Collect all upstream input images, in pin-index order
+                    // (matching customEffect.inputNames). The bridge binds
+                    // them at t0..t(N-1).
+                    std::vector<winrt::com_ptr<ID2D1Image>> inputImages;
                     {
-                        auto* srcNode = graph.FindNode(inputs[0]->sourceNodeId);
-                        if (srcNode) inputImage = srcNode->cachedOutput;
+                        // Find max destPin so we can size by declared input
+                        // count. Slots not connected get nullptr (the bridge
+                        // returns E_INVALIDARG, surfaced as a runtime error).
+                        uint32_t maxPin = 0;
+                        for (const auto* e : inputs)
+                            if (e->destPin >= maxPin) maxPin = e->destPin + 1;
+                        // Also bound by declared input count if known.
+                        uint32_t declaredCount = node->customEffect.has_value()
+                            ? static_cast<uint32_t>(node->customEffect->inputNames.size())
+                            : 0;
+                        uint32_t totalSlots = (std::max)(maxPin, declaredCount);
+                        if (totalSlots == 0 && !inputs.empty()) totalSlots = 1;
+                        inputImages.assign(totalSlots, {});
+                        for (const auto* e : inputs)
+                        {
+                            auto* srcNode = graph.FindNode(e->sourceNodeId);
+                            if (srcNode && srcNode->cachedOutput &&
+                                e->destPin < inputImages.size())
+                            {
+                                inputImages[e->destPin].copy_from(srcNode->cachedOutput);
+                            }
+                        }
                     }
+                    ID2D1Image* primaryInput = inputImages.empty() ? nullptr : inputImages[0].get();
                     bool hasImageOutput = !node->outputPins.empty();
                     // Image-producing compute: recompute when dirty or no cached output.
                     // Analysis-only compute: also recompute if no analysis fields yet.
@@ -263,7 +309,7 @@ namespace ShaderLab::Rendering
                         skipReadbackForcesRedispatch ||
                         (hasImageOutput && !node->cachedOutput) ||
                         (!hasImageOutput && node->analysisOutput.fields.empty());
-                    if (inputImage && needsCompute && !m_deferredComputeFrozen)
+                    if (primaryInput && needsCompute && !m_deferredComputeFrozen)
                     {
                         // Phase 8: ensure the bridge effect exists for this
                         // node so ProcessDeferredCompute can drive it via
@@ -271,14 +317,20 @@ namespace ShaderLab::Rendering
                         // the impl into m_bridgeImplCache.
                         GetOrCreateEffect(dc, *node);
 
-                        // For image-producing compute, pre-render the upstream
-                        // D2D chain to a bitmap NOW while properties are fresh.
-                        // This avoids D2D GPU caching returning stale data when
-                        // ProcessDeferredCompute renders later inside BeginDraw.
-                        winrt::com_ptr<ID2D1Bitmap1> preRendered;
+                        // For image-producing compute, pre-render every upstream
+                        // input to its own FP32 bitmap NOW while properties are
+                        // fresh. This avoids D2D GPU caching returning stale data
+                        // when ProcessDeferredCompute renders later inside BeginDraw.
+                        std::vector<winrt::com_ptr<ID2D1Bitmap1>> preRendered(inputImages.size());
                         if (hasImageOutput)
-                            preRendered = PreRenderInputBitmap(dc, inputImage);
-                        m_deferredCompute.push_back({ nodeId, inputImage, preRendered });
+                        {
+                            for (size_t i = 0; i < inputImages.size(); ++i)
+                            {
+                                if (inputImages[i])
+                                    preRendered[i] = PreRenderInputBitmap(dc, inputImages[i].get());
+                            }
+                        }
+                        m_deferredCompute.push_back({ nodeId, std::move(inputImages), std::move(preRendered) });
                     }
                     node->dirty = false;
                     if (!hasImageOutput)
@@ -557,19 +609,61 @@ namespace ShaderLab::Rendering
                     if (declaresOutputDims)
                     {
                         auto inputs = graph.GetInputEdges(nodeId);
-                        if (!inputs.empty())
+                        if (!inputs.empty() && dc)
                         {
-                            auto* srcNode = graph.FindNode(inputs[0]->sourceNodeId);
-                            if (srcNode && srcNode->cachedOutput && dc)
+                            // Compute the *union* of all input bounds, mirroring
+                            // CustomPixelShaderEffect::MapInputRectsToOutputRect
+                            // (which produces the actual D2D output rect this
+                            // shader runs over). Using only inputs[0] would
+                            // misreport OutputW/H whenever inputs have different
+                            // bounds (e.g. Split Comparison fed a 4K and a 2K
+                            // input), causing the shader's coordinate math --
+                            // including UV normalization -- to use a smaller
+                            // virtual canvas than the actual output rect.
+                            //
+                            // Per-input bounds (ImageAW/H, ImageBW/H ...) are
+                            // also captured so the shader can compensate for
+                            // D2D's atlas padding -- a D2D pixel-shader output
+                            // bitmap may live inside e.g. a 4096x4096 atlas
+                            // even when its content rect is only 1920x1080.
+                            // Sampling [0,1] would otherwise read the padding.
+                            float oldDpiX = 0, oldDpiY = 0;
+                            dc->GetDpi(&oldDpiX, &oldDpiY);
+                            dc->SetDpi(96.0f, 96.0f);
+                            float unionLeft = (std::numeric_limits<float>::max)();
+                            float unionTop = (std::numeric_limits<float>::max)();
+                            float unionRight = -(std::numeric_limits<float>::max)();
+                            float unionBottom = -(std::numeric_limits<float>::max)();
+                            bool anyValid = false;
+                            // Per-input content widths/heights, indexed by
+                            // destination pin (so input #0 = ImageA, #1 = ImageB,
+                            // ...). graph.GetInputEdges() returns edges in
+                            // arbitrary order, so we have to scatter into a
+                            // pin-indexed vector explicitly.
+                            std::vector<std::pair<float, float>> perInputWH(4, { 0.0f, 0.0f });
+                            for (const auto& edge : inputs)
                             {
-                                float oldDpiX = 0, oldDpiY = 0;
-                                dc->GetDpi(&oldDpiX, &oldDpiY);
-                                dc->SetDpi(96.0f, 96.0f);
-                                D2D1_RECT_F bounds{};
-                                dc->GetImageLocalBounds(srcNode->cachedOutput, &bounds);
-                                dc->SetDpi(oldDpiX, oldDpiY);
-                                float w = bounds.right - bounds.left;
-                                float h = bounds.bottom - bounds.top;
+                                auto* srcNode = graph.FindNode(edge->sourceNodeId);
+                                if (!srcNode || !srcNode->cachedOutput) continue;
+                                D2D1_RECT_F b{};
+                                if (FAILED(dc->GetImageLocalBounds(srcNode->cachedOutput, &b)))
+                                    continue;
+                                float bw = b.right - b.left;
+                                float bh = b.bottom - b.top;
+                                if (bw <= 0 || bh <= 0) continue;
+                                unionLeft   = (std::min)(unionLeft,   b.left);
+                                unionTop    = (std::min)(unionTop,    b.top);
+                                unionRight  = (std::max)(unionRight,  b.right);
+                                unionBottom = (std::max)(unionBottom, b.bottom);
+                                anyValid = true;
+                                if (edge->destPin < perInputWH.size())
+                                    perInputWH[edge->destPin] = { bw, bh };
+                            }
+                            dc->SetDpi(oldDpiX, oldDpiY);
+                            if (anyValid)
+                            {
+                                float w = unionRight - unionLeft;
+                                float h = unionBottom - unionTop;
                                 if (w > 0 && h > 0)
                                 {
                                     auto wIt = effectiveProps.find(L"OutputW");
@@ -585,6 +679,52 @@ namespace ShaderLab::Rendering
                                     effectiveProps[L"OutputH"] = h;
                                     node->properties[L"OutputW"] = w;
                                     node->properties[L"OutputH"] = h;
+
+                                    // Write per-input ImageAW/H / ImageBW/H /
+                                    // ImageCW/H / ImageDW/H -- but only if the
+                                    // shader actually declares those params.
+                                    static const wchar_t* kSlots[][2] = {
+                                        { L"ImageAW", L"ImageAH" },
+                                        { L"ImageBW", L"ImageBH" },
+                                        { L"ImageCW", L"ImageCH" },
+                                        { L"ImageDW", L"ImageDH" },
+                                    };
+                                    auto declaresParam = [&](const std::wstring& name) {
+                                        for (const auto& p : node->customEffect->parameters)
+                                            if (p.name == name) return true;
+                                        return false;
+                                    };
+                                    for (size_t i = 0; i < perInputWH.size() && i < std::size(kSlots); ++i)
+                                    {
+                                        const wchar_t* nW = kSlots[i][0];
+                                        const wchar_t* nH = kSlots[i][1];
+                                        if (!declaresParam(nW) || !declaresParam(nH)) continue;
+                                        // Fall back to the union dimensions when the input's
+                                        // cachedOutput is briefly nullptr (e.g. first frame
+                                        // after a compute branch is wired in -- deferred
+                                        // compute hasn't populated the wrapper bitmap yet).
+                                        // The shader's content/atlas math then degenerates
+                                        // to "atlas == content" which is correct for compute
+                                        // outputs (the typical case for null cachedOutput).
+                                        float iw = perInputWH[i].first;
+                                        float ih = perInputWH[i].second;
+                                        if (iw <= 0 || ih <= 0) { iw = w; ih = h; }
+                                        auto iwIt = effectiveProps.find(nW);
+                                        auto ihIt = effectiveProps.find(nH);
+                                        bool slotChanged =
+                                            (iwIt == effectiveProps.end() ||
+                                             !std::holds_alternative<float>(iwIt->second) ||
+                                             std::get<float>(iwIt->second) != iw) ||
+                                            (ihIt == effectiveProps.end() ||
+                                             !std::holds_alternative<float>(ihIt->second) ||
+                                             std::get<float>(ihIt->second) != ih);
+                                        effectiveProps[nW] = iw;
+                                        effectiveProps[nH] = ih;
+                                        node->properties[nW] = iw;
+                                        node->properties[nH] = ih;
+                                        if (slotChanged) changed = true;
+                                    }
+
                                     if (changed) wasDirty = true;
                                 }
                             }
@@ -724,6 +864,25 @@ namespace ShaderLab::Rendering
     {
         if (m_deferredCompute.empty() || !dc) return false;
 
+        // P7 / first-frame safety: if any Source node still has a null
+        // cachedOutput, the chain isn't ready (e.g., video provider was
+        // just created but hasn't decoded its first frame; image source
+        // hasn't loaded; capture provider awaiting first frame). Walking
+        // a downstream effect's GetImageLocalBounds chain through a null
+        // upstream input AVs deep inside d2d1.dll. Skip this frame --
+        // the next worker iteration will retry once the source is
+        // populated. We DO clear m_deferredCompute so the entries (which
+        // hold raw ID2D1Image* pointers to potentially stale objects)
+        // don't pile up across frames.
+        for (const auto& n : graph.Nodes())
+        {
+            if (n.type == NodeType::Source && !n.cachedOutput)
+            {
+                m_deferredCompute.clear();
+                return false;
+            }
+        }
+
         bool imageComputeProduced = false;
 
         // Phase 8c: build the per-frame "needs CPU readback" set. When
@@ -809,7 +968,28 @@ namespace ShaderLab::Rendering
             dc->SetDpi(96.0f, 96.0f);
 
             D2D1_RECT_F bounds{};
-            dc->GetImageLocalBounds(inputImage, &bounds);
+            // GetImageLocalBounds walks the input image's effect chain back
+            // to its source bitmap. If any upstream effect has a null/stale
+            // input -- which can happen on the FIRST frame after a graph
+            // load or GPU switch when a video source provider hasn't
+            // decoded its first frame yet -- d2d1.dll AVs deep inside.
+            // Wrap defensively and treat any failure as "not yet ready"
+            // so the next frame can retry once upstream has its bitmap.
+            HRESULT bhr = E_FAIL;
+            try
+            {
+                bhr = dc->GetImageLocalBounds(inputImage, &bounds);
+            }
+            catch (...)
+            {
+                dc->SetDpi(oldDpiX, oldDpiY);
+                return nullptr;
+            }
+            if (FAILED(bhr))
+            {
+                dc->SetDpi(oldDpiX, oldDpiY);
+                return nullptr;
+            }
             UINT32 w = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
             UINT32 h = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
             if (w == 0 || h == 0) { dc->SetDpi(oldDpiX, oldDpiY); return nullptr; }
@@ -856,7 +1036,7 @@ namespace ShaderLab::Rendering
         for (auto& deferred : m_deferredCompute)
         {
             auto* node = graph.FindNode(deferred.nodeId);
-            if (!node || !deferred.inputImage) continue;
+            if (!node || deferred.inputImages.empty() || !deferred.inputImages[0]) continue;
             if (!node->customEffect.has_value()) continue;
 
             auto bit = m_bridgeImplCache.find(node->id);
@@ -864,16 +1044,24 @@ namespace ShaderLab::Rendering
                 continue;
             auto* bridge = bit->second;
 
-            // Use the deferred entry's pre-rendered bitmap if it
-            // exists (image-producing computes pre-render in
+            // Use the deferred entry's pre-rendered bitmap per-input slot
+            // if it exists (image-producing computes pre-render in
             // EvaluateNode while D2D effect properties are fresh).
             // Otherwise share via the per-frame map.
-            ID2D1Bitmap1* preRendered = deferred.preRenderedInput.get();
-            if (!preRendered)
-                preRendered = preRenderShared(deferred.inputImage);
+            std::vector<ID2D1Bitmap1*> preRendered(deferred.inputImages.size(), nullptr);
+            std::vector<ID2D1Image*>   inputRaw(deferred.inputImages.size(), nullptr);
+            for (size_t i = 0; i < deferred.inputImages.size(); ++i)
+            {
+                if (!deferred.inputImages[i]) continue;
+                inputRaw[i] = deferred.inputImages[i].get();
+                if (i < deferred.preRenderedInputs.size() && deferred.preRenderedInputs[i])
+                    preRendered[i] = deferred.preRenderedInputs[i].get();
+                else
+                    preRendered[i] = preRenderShared(inputRaw[i]);
+            }
 
             const bool readback = isReadbackNeeded(node->id);
-            DispatchViaBridge(dc, graph, *node, deferred.inputImage,
+            DispatchViaBridge(dc, graph, *node, inputRaw,
                 preRendered, bridge, readback);
 
             // Phase 8c: record the timestamp for hinted nodes whose
@@ -928,8 +1116,8 @@ namespace ShaderLab::Rendering
         ID2D1DeviceContext5* dc,
         const EffectGraph& graph,
         EffectNode& node,
-        ID2D1Image* inputImage,
-        ID2D1Bitmap1* preRenderedInput,
+        const std::vector<ID2D1Image*>& inputImages,
+        const std::vector<ID2D1Bitmap1*>& preRenderedInputs,
         Effects::CustomComputeBridgeEffect* bridge,
         bool readbackToCpu)
     {
@@ -1118,16 +1306,16 @@ namespace ShaderLab::Rendering
                 if (key == L"OutputWidth")
                 {
                     if (auto* f = std::get_if<float>(&val))
-                        explicitW = static_cast<UINT32>((std::max)(*f, 64.0f));
+                        explicitW = (*f >= 1.0f) ? static_cast<UINT32>(*f) : 0;
                     else if (auto* u = std::get_if<uint32_t>(&val))
-                        explicitW = (std::max)(*u, 64u);
+                        explicitW = *u;
                 }
                 else if (key == L"OutputHeight")
                 {
                     if (auto* f = std::get_if<float>(&val))
-                        explicitH = static_cast<UINT32>((std::max)(*f, 64.0f));
+                        explicitH = (*f >= 1.0f) ? static_cast<UINT32>(*f) : 0;
                     else if (auto* u = std::get_if<uint32_t>(&val))
-                        explicitH = (std::max)(*u, 64u);
+                        explicitH = *u;
                 }
             }
             if (explicitW > 0 && explicitH > 0)
@@ -1156,21 +1344,27 @@ namespace ShaderLab::Rendering
             }
             if (imageOutW == 0)
             {
-                // Fall back to upstream input dimensions (96 DPI bounds
+                // Fall back to upstream input #0 dimensions (96 DPI bounds
                 // from the pre-rendered bitmap, if any, else the input
-                // image's bounds).
-                if (preRenderedInput)
+                // image's bounds). For multi-input shaders we still drive
+                // dispatch sizing from t0 -- the contract is that all
+                // inputs match dimensions.
+                ID2D1Bitmap1* primaryPreRendered =
+                    preRenderedInputs.empty() ? nullptr : preRenderedInputs[0];
+                ID2D1Image* primaryInput =
+                    inputImages.empty() ? nullptr : inputImages[0];
+                if (primaryPreRendered)
                 {
-                    auto sz = preRenderedInput->GetPixelSize();
+                    auto sz = primaryPreRendered->GetPixelSize();
                     imageOutW = sz.width; imageOutH = sz.height;
                 }
-                else
+                else if (primaryInput)
                 {
                     float oldDpiX, oldDpiY;
                     dc->GetDpi(&oldDpiX, &oldDpiY);
                     dc->SetDpi(96.0f, 96.0f);
                     D2D1_RECT_F bounds{};
-                    dc->GetImageLocalBounds(inputImage, &bounds);
+                    dc->GetImageLocalBounds(primaryInput, &bounds);
                     imageOutW = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
                     imageOutH = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
                     dc->SetDpi(oldDpiX, oldDpiY);
@@ -1258,13 +1452,19 @@ namespace ShaderLab::Rendering
         }
 
         // Drive the dispatch through the bridge. The bridge handles
-        // pre-rendering internally; if we have a pre-rendered bitmap
-        // it's a cheap blit (same FP32 format). Use it directly when
+        // pre-rendering internally; if we have pre-rendered bitmaps
+        // it's a cheap blit (same FP32 format). Use them directly when
         // available so D2D doesn't re-evaluate upstream effects with
         // potentially-different cached state.
-        ID2D1Image* dispatchInput = preRenderedInput
-            ? static_cast<ID2D1Image*>(preRenderedInput)
-            : inputImage;
+        std::vector<ID2D1Image*> dispatchInputs(inputImages.size(), nullptr);
+        for (size_t i = 0; i < inputImages.size(); ++i)
+        {
+            ID2D1Bitmap1* preRendered = (i < preRenderedInputs.size())
+                ? preRenderedInputs[i] : nullptr;
+            dispatchInputs[i] = preRendered
+                ? static_cast<ID2D1Image*>(preRendered)
+                : inputImages[i];
+        }
 
         // Phase 8 GPU bindings: register each upstream SRV with its
         // declared t-slot. Bridge clears these at the end of Dispatch.
@@ -1292,13 +1492,22 @@ namespace ShaderLab::Rendering
         if (hasImageOutput && imageOutW > 0 && imageOutH > 0 &&
             def.threadGroupX > 0 && def.threadGroupY > 0)
         {
-            bool isFixedSizeViewer = false;
+            // Discriminator: single-group scatter shaders use a large
+            // thread group (commonly 32x32 = 1024) and dispatch (1,1,1);
+            // per-pixel-tile shaders use a small group (commonly 8x8 = 64)
+            // and dispatch (W/tx, H/ty, 1). Threshold at 256 cleanly
+            // separates the two conventions in the current catalog.
+            //
+            // The DiagramSize / OutputSize parameter names ALSO mark fixed-
+            // output viewers (CIE Histogram, etc.) that pre-date the
+            // generic threshold; keep that check for descriptors that use
+            // an 8x8 group but still want single-group dispatch (none
+            // exist today, but the check is cheap and safe).
+            const bool largeGroup = (def.threadGroupX * def.threadGroupY) >= 256;
+            bool isFixedSizeViewer = largeGroup;
             for (const auto& p : def.parameters)
             {
-                if (p.name == L"DiagramSize"  ||
-                    p.name == L"OutputSize"   ||
-                    p.name == L"OutputWidth"  ||
-                    p.name == L"OutputHeight")
+                if (p.name == L"DiagramSize" || p.name == L"OutputSize")
                 {
                     isFixedSizeViewer = true;
                     break;
@@ -1322,7 +1531,9 @@ namespace ShaderLab::Rendering
         // returns an empty `floats` vector. The structured-buffer SRV
         // is still populated on the GPU side for downstream consumers.
         HRESULT hr = bridge->Dispatch(
-            dc, dispatchInput,
+            dc,
+            dispatchInputs.data(),
+            static_cast<UINT32>(dispatchInputs.size()),
             cbBytes.empty() ? nullptr : cbBytes.data(),
             static_cast<UINT32>(cbBytes.size()),
             analysisFloat4Count,
@@ -1480,6 +1691,14 @@ namespace ShaderLab::Rendering
         m_sharedPreRenderCache.clear();
         m_lastHintReadbackTime.clear();
         m_dummySourceBitmap = nullptr;
+
+        // P7: also drop any deferred-compute entries that the previous
+        // Evaluate left pending for ProcessDeferredCompute. They hold raw
+        // ID2D1Image* pointers to the cachedOutputs we just released; if
+        // we don't clear here, the next ProcessDeferredCompute call (from
+        // the post-SwitchAdapter worker, or any path that resets the
+        // device) deref's freed bitmaps and AVs in d2d1.dll.
+        m_deferredCompute.clear();
     }
 
     void GraphEvaluator::ReleaseCache(EffectGraph& graph)

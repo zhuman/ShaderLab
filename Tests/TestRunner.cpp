@@ -11,7 +11,12 @@
 #include "Effects/Performance.h"
 #include "Effects/CustomPixelShaderEffect.h"
 #include "Effects/CustomComputeShaderEffect.h"
+#include "Rendering/RenderThreadDispatcher.h"
+#include "Graph/GraphUiSnapshot.h"
 #include "Rendering/D3DDefinitions.h"
+
+#include <atomic>
+#include <thread>
 
 #include <cstdio>
 #include <cmath>
@@ -1263,6 +1268,257 @@ float4 main(float4 pos : SV_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET {
 
         std::printf("    pixel = (%.4f, %.4f, %.4f, %.4f)\n", r, green, b, a);
     }
+
+    void TestSnapshot()
+    {
+        printf("\n=== GraphUiSnapshot ===\n");
+        auto& registry = ShaderLab::Effects::ShaderLabEffects::Instance();
+        ShaderLab::Graph::EffectGraph g;
+        auto srcDesc = registry.FindByName(L"Gamut Source");
+        auto dstDesc = registry.FindByName(L"Gamut Source");
+        auto srcId = g.AddNode(ShaderLab::Effects::ShaderLabEffects::CreateNode(*srcDesc));
+        auto dstId = g.AddNode(ShaderLab::Effects::ShaderLabEffects::CreateNode(*dstDesc));
+        g.Connect(srcId, 0, dstId, 0);
+
+        // Stash a fake cachedOutput on a node to confirm the snapshot strips
+        // it (raw ID2D1Image* must never escape into UI code).
+        auto* live = g.FindNode(srcId);
+        live->cachedOutput = reinterpret_cast<ID2D1Image*>(static_cast<uintptr_t>(0xDEADBEEFu));
+        live->runtimeError = L"oops";
+        live->dirty = true;
+
+        auto snap = ShaderLab::Graph::BuildGraphUiSnapshot(
+            g, /*previewId*/ dstId, /*graphGen*/ 7, /*frameGen*/ 99);
+        TEST("BuildSnapshot returns non-null",        snap != nullptr);
+        TEST("Snapshot graphGeneration",              snap->graphGeneration == 7);
+        TEST("Snapshot frameGeneration",              snap->frameGeneration == 99);
+        TEST("Snapshot previewNodeId",                snap->previewNodeId == dstId);
+        TEST("Snapshot node count matches live",      snap->nodes.size() == 2);
+        TEST("Snapshot edge count matches live",      snap->edges.size() == 1);
+        TEST("Snapshot lookup by id works",           snap->FindNode(srcId) != nullptr);
+        TEST("Snapshot lookup unknown id is null",    snap->FindNode(99999u) == nullptr);
+        TEST("Snapshot strips cachedOutput",          snap->FindNode(srcId)->cachedOutput == nullptr);
+        TEST("Snapshot preserves runtimeError",       snap->FindNode(srcId)->runtimeError == L"oops");
+        TEST("Snapshot preserves dirty flag",         snap->FindNode(srcId)->dirty);
+        TEST("Snapshot edge mirrors connection",
+             snap->edges[0].sourceNodeId == srcId && snap->edges[0].destNodeId == dstId);
+
+        // Mutating the live graph after snapshot must not affect the snap.
+        g.RemoveNode(srcId);
+        TEST("Live mutation does not affect snapshot",
+             snap->nodes.size() == 2 && snap->FindNode(srcId) != nullptr);
+
+        // atomic<shared_ptr> publication round-trip.
+        std::atomic<std::shared_ptr<const ShaderLab::Graph::GraphUiSnapshot>> latest{ snap };
+        auto loaded = latest.load();
+        TEST("atomic<shared_ptr> publication round-trips", loaded == snap);
+    }
+
+    void TestRenderThreadDispatcher()
+    {
+        printf("\n=== RenderThreadDispatcher ===\n");
+
+        // ---- Synchronous mode runs inline, no threading. ------------------
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d{ /*synchronous=*/true };
+            int counter = 0;
+            d.DispatchAsync([&]{ counter++; });
+            TEST("synchronous mode runs DispatchAsync inline",
+                 counter == 1);
+
+            int sum = d.DispatchSync([]{ return 7 + 35; });
+            TEST("synchronous mode DispatchSync returns value", sum == 42);
+
+            // Re-entry from inside a closure runs inline.
+            int reentry = 0;
+            d.DispatchSync([&]{
+                d.DispatchSync([&]{ reentry = 99; });
+            });
+            TEST("synchronous mode allows re-entrant DispatchSync",
+                 reentry == 99);
+        }
+
+        // ---- Async-with-consumer-thread happy path. -----------------------
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d;
+            std::atomic<bool> stop{ false };
+            std::thread consumer([&]{
+                d.RegisterConsumer();
+                while (!stop.load(std::memory_order_acquire))
+                {
+                    d.WaitFor(std::chrono::milliseconds(50));
+                    d.Drain();
+                }
+                d.Drain();
+            });
+
+            std::atomic<int> hits{ 0 };
+            for (int i = 0; i < 100; ++i)
+                d.DispatchAsync([&]{ hits.fetch_add(1, std::memory_order_relaxed); });
+
+            // DispatchSync from a non-consumer thread blocks until done.
+            int v = d.DispatchSync([&]{
+                return hits.load(std::memory_order_relaxed);
+            });
+            TEST("async drain ran all enqueued closures (>=100)", v >= 100);
+            TEST("async DispatchSync returned a value seen on consumer",
+                 v == 100);
+
+            stop.store(true, std::memory_order_release);
+            d.Wake();
+            consumer.join();
+        }
+
+        // ---- Re-entrant DispatchSync from inside a closure runs inline. ---
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d;
+            std::atomic<bool> stop{ false };
+            std::thread consumer([&]{
+                d.RegisterConsumer();
+                while (!stop.load(std::memory_order_acquire))
+                {
+                    d.WaitFor(std::chrono::milliseconds(50));
+                    d.Drain();
+                }
+                d.Drain();
+            });
+
+            int outer = 0, inner = 0;
+            d.DispatchSync([&]{
+                outer = 1;
+                // From inside a closure (= consumer thread), DispatchSync
+                // must NOT requeue and self-deadlock; it must run inline.
+                d.DispatchSync([&]{ inner = 2; });
+            });
+            TEST("re-entrant DispatchSync did not deadlock",
+                 outer == 1 && inner == 2);
+
+            stop.store(true, std::memory_order_release);
+            d.Wake();
+            consumer.join();
+        }
+
+        // ---- Closure exception propagates back through DispatchSync. ------
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d{ /*synchronous=*/true };
+            bool threw = false;
+            try
+            {
+                d.DispatchSync([]() -> int {
+                    throw std::runtime_error("expected test failure");
+                });
+            }
+            catch (const std::exception&) { threw = true; }
+            TEST("DispatchSync re-throws closure exception", threw);
+        }
+
+        // ---- Shutdown cancels pending closures and unblocks waiters. ------
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d;
+            std::atomic<bool> consumerRan{ false };
+            std::thread consumer([&]{
+                d.RegisterConsumer();
+                d.Wait();          // returns when shutdown signaled
+                consumerRan.store(true, std::memory_order_release);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            d.Shutdown();
+            consumer.join();
+            TEST("Shutdown wakes Wait()", consumerRan.load());
+            TEST("Shutdown clears queue", d.QueueDepth() == 0);
+            TEST("IsShuttingDown reflects state", d.IsShuttingDown());
+        }
+
+        // ---- P19: many concurrent producers, single consumer. ------------
+        // Stress test: 8 producer threads each post 250 sync closures
+        // returning a unique tag. All 2000 closures must run on the consumer
+        // thread (single thread id seen) and each producer must observe its
+        // own tag back.
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d;
+            std::atomic<bool> stop{ false };
+            std::atomic<int> totalRan{ 0 };
+            std::atomic<std::thread::id> consumerId{};
+            std::atomic<bool> mixedThread{ false };
+            std::thread consumer([&]{
+                d.RegisterConsumer();
+                consumerId.store(std::this_thread::get_id(), std::memory_order_release);
+                while (!stop.load(std::memory_order_acquire)) {
+                    d.WaitFor(std::chrono::milliseconds(5));
+                    d.Drain();
+                }
+                d.Drain();
+            });
+
+            constexpr int producers = 8;
+            constexpr int perProducer = 250;
+            std::vector<std::thread> producerThreads;
+            std::atomic<int> mismatches{ 0 };
+            producerThreads.reserve(producers);
+            for (int p = 0; p < producers; ++p) {
+                producerThreads.emplace_back([&, p]{
+                    for (int i = 0; i < perProducer; ++i) {
+                        int tag = p * 1000 + i;
+                        int got = d.DispatchSync([&, tag]{
+                            if (std::this_thread::get_id() != consumerId.load())
+                                mixedThread.store(true);
+                            totalRan.fetch_add(1, std::memory_order_relaxed);
+                            return tag;
+                        });
+                        if (got != tag) mismatches.fetch_add(1);
+                    }
+                });
+            }
+            for (auto& t : producerThreads) t.join();
+            stop.store(true, std::memory_order_release);
+            d.Wake();
+            consumer.join();
+
+            TEST("8 producers x 250 closures all ran",
+                totalRan.load() == producers * perProducer);
+            TEST("every closure ran on the consumer thread",
+                !mixedThread.load());
+            TEST("every DispatchSync returned its own tag",
+                mismatches.load() == 0);
+        }
+
+        // ---- P19: shutdown with many pending closures unblocks all. ------
+        // Producers that are blocked in DispatchSync must wake when Shutdown
+        // is called. They get an exception (std::runtime_error from the
+        // dispatcher), not a hang.
+        {
+            ShaderLab::Rendering::RenderThreadDispatcher d;
+            std::thread consumer([&]{
+                d.RegisterConsumer();
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                // never drain -- closures pile up in the queue
+            });
+
+            constexpr int producers = 4;
+            std::vector<std::thread> producerThreads;
+            std::atomic<int> threwCount{ 0 };
+            std::atomic<int> noThrowCount{ 0 };
+            for (int p = 0; p < producers; ++p) {
+                producerThreads.emplace_back([&]{
+                    try {
+                        d.DispatchSync([]{ return 1; });
+                        noThrowCount.fetch_add(1);
+                    } catch (...) {
+                        threwCount.fetch_add(1);
+                    }
+                });
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            d.Shutdown();
+            for (auto& t : producerThreads) t.join();
+            consumer.join();
+
+            TEST("Shutdown unblocks pending DispatchSync producers",
+                threwCount.load() + noThrowCount.load() == producers);
+            TEST("at least some producers observed shutdown",
+                threwCount.load() > 0);
+        }
+    }
 }
 
 int main(int argc, char* argv[])
@@ -1338,6 +1594,8 @@ int main(int argc, char* argv[])
     TestGpuBindingRouting();
     TestSkipCpuReadback();
     TestHeadlessReadback();
+    TestSnapshot();
+    TestRenderThreadDispatcher();
 
     // ---- Math test bench (Phase 2) -----------------------------------------
     {

@@ -317,14 +317,26 @@ namespace ShaderLab::Controls
         float ddx = dx - m_selection.dragOffset.x;
         float ddy = dy - m_selection.dragOffset.y;
 
+        // Drag updates fire at pointer-move rate (~60Hz). Route through the
+        // dispatcher so positions are written on the render thread once it
+        // spawns. Synchronous mode runs the closure inline -- equivalent to
+        // direct mutation.
+        auto applyPositions = [&]{
+            for (uint32_t nodeId : m_selection.selectedNodeIds)
+            {
+                auto* node = m_graph->FindNode(nodeId);
+                if (node)
+                {
+                    node->position.x += ddx;
+                    node->position.y += ddy;
+                }
+            }
+        };
+        if (m_dispatcher) m_dispatcher->DispatchSync(applyPositions);
+        else              applyPositions();
+
         for (uint32_t nodeId : m_selection.selectedNodeIds)
         {
-            auto* node = m_graph->FindNode(nodeId);
-            if (node)
-            {
-                node->position.x += ddx;
-                node->position.y += ddy;
-            }
             // Update visual.
             auto vit = m_visuals.find(nodeId);
             if (vit != m_visuals.end())
@@ -474,7 +486,17 @@ namespace ShaderLab::Controls
             {
                 auto& fieldName = srcIt->second.dataOutputPinNames[srcPinIdx];
                 auto& propName = dstIt->second.dataInputPinNames[dstPinIdx];
-                auto err = m_graph->BindProperty(dstNodeId, propName, srcNodeId, fieldName, 0);
+                std::wstring err;
+                if (m_dispatcher)
+                {
+                    m_dispatcher->DispatchSync([&]{
+                        err = m_graph->BindProperty(dstNodeId, propName, srcNodeId, fieldName, 0);
+                    });
+                }
+                else
+                {
+                    err = m_graph->BindProperty(dstNodeId, propName, srcNodeId, fieldName, 0);
+                }
                 result = err.empty();
             }
             connSrcId = srcNodeId; connSrcPin = srcPinIdx;
@@ -487,13 +509,23 @@ namespace ShaderLab::Controls
             {
                 connSrcId = m_connectionDrag.sourceNodeId; connSrcPin = m_connectionDrag.sourcePin;
                 connDstId = targetNodeId; connDstPin = targetPin;
-                result = m_graph->Connect(connSrcId, connSrcPin, connDstId, connDstPin);
+                if (m_dispatcher)
+                    m_dispatcher->DispatchSync([&]{
+                        result = m_graph->Connect(connSrcId, connSrcPin, connDstId, connDstPin);
+                    });
+                else
+                    result = m_graph->Connect(connSrcId, connSrcPin, connDstId, connDstPin);
             }
             else if (!m_connectionDrag.fromOutput && targetIsOutput)
             {
                 connSrcId = targetNodeId; connSrcPin = targetPin;
                 connDstId = m_connectionDrag.sourceNodeId; connDstPin = m_connectionDrag.sourcePin;
-                result = m_graph->Connect(connSrcId, connSrcPin, connDstId, connDstPin);
+                if (m_dispatcher)
+                    m_dispatcher->DispatchSync([&]{
+                        result = m_graph->Connect(connSrcId, connSrcPin, connDstId, connDstPin);
+                    });
+                else
+                    result = m_graph->Connect(connSrcId, connSrcPin, connDstId, connDstPin);
             }
         }
 
@@ -550,10 +582,23 @@ namespace ShaderLab::Controls
     {
         if (!m_graph) return;
 
-        for (uint32_t nodeId : m_selection.selectedNodeIds)
+        if (m_dispatcher)
         {
-            m_graph->RemoveNode(nodeId);
-            m_visuals.erase(nodeId);
+            auto idsToRemove = m_selection.selectedNodeIds;
+            m_dispatcher->DispatchSync([&]{
+                for (uint32_t nodeId : idsToRemove)
+                    m_graph->RemoveNode(nodeId);
+            });
+            for (uint32_t nodeId : idsToRemove)
+                m_visuals.erase(nodeId);
+        }
+        else
+        {
+            for (uint32_t nodeId : m_selection.selectedNodeIds)
+            {
+                m_graph->RemoveNode(nodeId);
+                m_visuals.erase(nodeId);
+            }
         }
         m_selection.selectedNodeIds.clear();
         m_needsRedraw = true;
@@ -603,7 +648,18 @@ namespace ShaderLab::Controls
         }
 
         node.position = { canvasPos.x, canvasPos.y };
-        uint32_t id = m_graph->AddNode(std::move(node));
+        uint32_t id = 0;
+        Graph::EffectNode movedNode = std::move(node);
+        if (m_dispatcher)
+        {
+            m_dispatcher->DispatchSync([&]{
+                id = m_graph->AddNode(std::move(movedNode));
+            });
+        }
+        else
+        {
+            id = m_graph->AddNode(std::move(movedNode));
+        }
 
         auto* added = m_graph->FindNode(id);
         if (added)
@@ -1697,9 +1753,17 @@ namespace ShaderLab::Controls
 
         if (!hit.isDataBinding)
         {
-            bool ok = m_graph->Disconnect(
-                hit.sourceNodeId, hit.sourcePin,
-                hit.destNodeId, hit.destPin);
+            bool ok = false;
+            if (m_dispatcher)
+                m_dispatcher->DispatchSync([&]{
+                    ok = m_graph->Disconnect(
+                        hit.sourceNodeId, hit.sourcePin,
+                        hit.destNodeId, hit.destPin);
+                });
+            else
+                ok = m_graph->Disconnect(
+                    hit.sourceNodeId, hit.sourcePin,
+                    hit.destNodeId, hit.destPin);
             if (ok)
             {
                 m_needsRedraw = true;
@@ -1741,11 +1805,26 @@ namespace ShaderLab::Controls
         }
 
         if (removeAll)
-            m_graph->UnbindProperty(hit.destNodeId, hit.destPropertyName);
+        {
+            if (m_dispatcher)
+                m_dispatcher->DispatchSync([&]{
+                    m_graph->UnbindProperty(hit.destNodeId, hit.destPropertyName);
+                });
+            else
+                m_graph->UnbindProperty(hit.destNodeId, hit.destPropertyName);
+        }
         else
         {
-            destNode->dirty = true;
-            m_graph->MarkAllDirty();
+            if (m_dispatcher)
+                m_dispatcher->DispatchSync([&]{
+                    destNode->dirty = true;
+                    m_graph->MarkAllDirty();
+                });
+            else
+            {
+                destNode->dirty = true;
+                m_graph->MarkAllDirty();
+            }
         }
         m_needsRedraw = true;
         return true;

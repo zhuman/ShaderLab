@@ -8,7 +8,7 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 
 - **C++/WinRT only** — never generate C# code. Direct COM access to `ID2D1EffectImpl`, `ID2D1DrawTransform`, `ID2D1ComputeTransform` is the reason this project exists.
 - **`docs/` is the living architecture documentation tree.** Update the relevant file under `docs/architecture/`, `docs/effects/`, etc. when a significant architectural change lands. Append a new entry to [`docs/history/decision-log.md`](../docs/history/decision-log.md) with a Mermaid diagram for any choice that future contributors will need to understand the *why* of. The repo-root `README.md` is intentionally slim — install + build + a pointer to `docs/` — and should not be expanded with technical detail.
-- **All new `.cpp` files must `#include "pch.h"` as the first include** — precompiled header is mandatory (`pch.h` aggregates WinRT, D2D, D3D, Win2D, DXGI, WIC, and STL headers).
+- **All new `.cpp` files must `#include "pch.h"` as the first include** — precompiled header is mandatory (`pch.h` aggregates WinRT, D2D, D3D, DXGI, WIC, and STL headers).
 
 ## Build
 
@@ -16,7 +16,7 @@ ShaderLab is a WinUI 3 desktop application (C++/WinRT) for developing, testing, 
 - NuGet packages restore automatically (packages.config style, not PackageReference)
 - Build target: **Debug | x64** (also supports ARM64, Release)
 - No command-line build scripts exist; use MSBuild via VS or `msbuild ShaderLab.vcxproj /p:Configuration=Debug /p:Platform=x64`
-- Required: Windows App SDK 1.8, Windows 10 SDK 10.0.26100+, Win2D 1.3.0
+- Required: Windows App SDK 1.8, Windows 10 SDK 10.0.26100+
 - Linked native libs: `d3d11.lib`, `d2d1.lib`, `dxgi.lib`, `d3dcompiler.lib`, `dxguid.lib`, `windowscodecs.lib`
 - `/bigobj` is enabled; language standard is C++20 (VS 18+) or C++17 (VS 17)
 
@@ -62,7 +62,7 @@ ShaderLabHeadless.exe (console host, no WinUI dependency)
   └── Main.cpp                  — PNG render / --pixels FP32 readback / --script JSON batch mode
 ```
 
-Render loop: `DispatcherQueueTimer` driven by the active monitor's refresh rate (clamped to 60–240 Hz, decision #50) → dirty-propagation BFS → `BeginDraw` → `GraphEvaluator.Evaluate()` → `ProcessDeferredCompute()` (D3D11 compute analysis nodes; **must** be inside the `BeginDraw`/`EndDraw` so the internal `dc->DrawImage` actually runs — decision #63) → `DrawImage(previewOutput)` → `EndDraw` → `Present`. There is no built-in tone-mapping pass — users build tone mappers as graph effects (the ICtCp suite is the preferred path).
+Render loop: a **render worker `std::jthread`** (MTA) drives graph evaluation at the active monitor's refresh rate (clamped to 60–240 Hz, decision #50). Per tick: drain `RenderThreadDispatcher` closures → dirty-propagation BFS → `BeginDraw` on the render-side D2D context → `GraphEvaluator.Evaluate()` → `ProcessDeferredCompute()` (D3D11 compute analysis nodes; **must** be inside the `BeginDraw`/`EndDraw` so the internal `dc->DrawImage` actually runs — decision #63) → `DrawImage(previewOutput)` into one of two double-buffered offscreen `ID3D11Texture2D`s → `EndDraw` → publish `m_offscreenPublishedIdx`. The **UI thread** (XAML STA) runs a `DispatcherQueueTimer` that blits the latest published offscreen onto the `SwapChainPanel`-bound swap chain and `Present1`s; UI Present cost is sub-ms regardless of graph throughput. Users build tone mappers as graph effects (the ICtCp suite is the preferred path); there is no built-in tone-mapping pass. See [Threading Model](../docs/architecture/threading-model.md) for the full UI ↔ worker contract (decision #68).
 
 ## Namespace Convention
 
@@ -132,10 +132,10 @@ Active development centers on **tone-mapping and color-correction effects author
 - **Display monitoring**: Dual path — `WM_DISPLAYCHANGE` via hidden message-only HWND + `IDXGIFactory7::RegisterAdaptersChangedEvent` on a jthread.
 - **Graph serialization**: `Windows.Data.Json` (zero extra dependencies). GUID fields use `StringFromGUID2`/`CLSIDFromString`.
 - **Effect registry**: Singleton with 40+ built-in D2D effects across 9 categories. Case-insensitive name lookup.
-- **ShaderLab effects library**: 35 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map), Source / Generator, Composition (Split Comparison), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use.
+- **ShaderLab effects library**: 33 built-in effects in `Effects/ShaderLabEffects.h/.cpp` across categories: Analysis (Heatmaps + Scopes + Statistics + Tone-Mapping), Color Processing (Gamut Map + ICtCp Gamut Map + Scale), Source / Generator, Composition (Split Comparison), and the data-only Parameter / Clock / Numeric Expression / Random / Working Space nodes. Embedded HLSL with shared color math from `Effects/ColorMath.cpp`. Auto-compiled at first use; bytecode cached on disk under `%LOCALAPPDATA%\ShaderLab\bytecode\` (decision #58 catalog → see [builtin-catalog.md](../docs/effects/builtin-catalog.md) for the full per-effect type table).
 - **MCP server**: JSON-RPC 2.0 server on port 47808 (47809 for headless to avoid shared-machine conflicts). The server itself + 20 engine-pure routes live in `Engine/Mcp/{McpHttpServer,EngineMcpRoutes}.{h,cpp}`; 16 UI-coupled / host-specific routes stay in `MainWindow.McpRoutes.cpp`. Both hosts register the same engine-side route set through the same `IEngineCommandSink` interface (decision #58). Engine-side routes are uniform: pure mutation closures dispatched via `sink.Dispatch`, with 8 event hooks (`OnNodeAdded`, `OnNodeRemoved`, `OnNodeChanged`, `OnGraphCleared`, `OnGraphLoaded`, `OnGraphStructureChanged`, `OnCustomEffectRecompiled`, `OnDisplayProfileChanged`) the GUI overrides to keep its UI in sync.
-- **Versioning**: `Version.h` defines app version (currently **1.5.0**) and graph format version (2). Both are stored in saved graphs. Forward compatibility check on load. `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` is independent — bumped manually on engine ABI breaks; mismatch between header and DLL aborts startup with a friendly message-box.
-- **Refresh-rate-driven render loop**: `DispatcherQueueTimer` interval is set from the active monitor's refresh rate (clamped to 60–240 Hz). Dirty-gated: skips evaluate when no nodes changed. Re-applied on every display change so dragging the window across monitors picks up the new rate.
+- **Versioning**: `Version.h` defines app version (currently **1.7.3**) and graph format version (2). Both are stored in saved graphs. Forward compatibility check on load. `EngineExport.h::SHADERLAB_ENGINE_ABI_VERSION` is independent — bumped manually on engine ABI breaks; mismatch between header and DLL aborts startup with a friendly message-box.
+- **Refresh-rate-driven render loop on the worker thread**: the render worker `std::jthread` runs the graph evaluate at the active monitor's refresh rate (clamped to 60–240 Hz). Dirty-gated: skips evaluate when no nodes changed, no output window is open, and `m_forceRender` is false. The UI thread runs a `DispatcherQueueTimer` at the same rate, but its body is just "drain dispatcher + blit offscreen + Present1" — sub-ms cost. The interval is re-applied on every display change so dragging the window across monitors picks up the new rate.
 - **`ProcessDeferredCompute` requires an active D2D draw session**: it calls `dc->DrawImage` internally to pre-render the upstream chain into an FP32 bitmap, and outside `BeginDraw`/`EndDraw` that DrawImage silently no-ops. The GUI's `RenderFrame`, the headless host's `runEval` / `RunRender`, and the test bench all wrap accordingly.
 - **Ctrl+Enter** compiles shader from the editor TextBox.
 
@@ -169,16 +169,16 @@ The built-in effects library lives in `Effects/ShaderLabEffects.h/.cpp`:
 - **Embedded HLSL**: Each effect's shader code is stored as a `const char*` string constant. No external `.hlsl` files.
 - **Shared color math**: A common HLSL library (BT.709/BT.2020/P3 color matrices, PQ/HLG transfer functions, CIE XYZ↔xy conversions, luminance calculations) is prepended to each shader at compile time.
 - **Auto-compile**: Effects are compiled via `ShaderCompiler` at first use (when added to graph). Compiled bytecode is cached.
-- **Categories**:
-  - **Analysis → Heatmaps** (PS): Luminance Heatmap, Gamut Highlight, Luminance Highlight, Nit Map, Delta E Comparator
-  - **Analysis → Scopes** (PS or CS): Vectorscope, Waveform Monitor, CIE Histogram (CS), CIE Chromaticity Plot
-  - **Analysis → Statistics** (D3D11 compute, data-only): Channel Statistics, Luminance Statistics, Chromaticity Statistics
-  - **Analysis → Tone Mapping** (PS, ICtCp suite): ICtCp Round-Trip Validator, ICtCp Tone Map, ICtCp Inverse Tone Map, ICtCp Saturation, ICtCp Highlight Desaturation
-  - **Analysis → Gamut**: Gamut Coverage (CS), ICtCp Boundary (PS)
-  - **Color Processing** (PS): Gamut Map, ICtCp Gamut Map
-  - **Source / Generator** (PS): Gamut Source, Color Checker, Zone Plate, Gradient Generator, HDR Test Pattern
-  - **Composition**: Split Comparison
-  - **Parameter / Data-only**: Float / Integer / Toggle / Gamut Parameter, Clock, Numeric Expression (ExprTk), Random, Working Space
+- **Categories** (33 effects total):
+  - **Analysis → Heatmaps** (D3D11 Compute with image output): Luminance Heatmap, Luminance Highlight, Delta E Comparator. **Pixel Shader**: Gamut Highlight, Nit Map.
+  - **Analysis → Scopes**: CIE Histogram (D3D11 Compute), CIE Chromaticity Plot (Pixel Shader). (Vectorscope and Waveform Monitor were removed in Phase 8 — they no longer ship.)
+  - **Analysis → Statistics** (D3D11 Compute, data-only): Channel Statistics, Luminance Statistics, Chromaticity Statistics, Image Info.
+  - **Analysis → Tone Mapping** (ICtCp suite): ICtCp Round-Trip Validator (PS), ICtCp Tone Map (D3D11 Compute), ICtCp Inverse Tone Map (D3D11 Compute), ICtCp Saturation (PS), ICtCp Highlight Desaturation (D3D11 Compute).
+  - **Analysis → Gamut**: Gamut Coverage (D3D11 Compute), ICtCp Boundary (PS).
+  - **Color Processing** (PS): Gamut Map, ICtCp Gamut Map. **D3D11 Compute**: Scale.
+  - **Source / Generator** (PS): Gamut Source, Color Checker, Zone Plate, Gradient Generator, HDR Test Pattern.
+  - **Composition** (PS): Split Comparison.
+  - **Parameter / Data-only**: Float / Integer / Toggle / Gamut Parameter, Clock, Numeric Expression (ExprTk), Random, Working Space.
 - No `_hidden` suffix convention. (Removed in Phase-0 cleanup. Sink-only properties — e.g., the Working Space node's `ActiveColorMode`, `SdrWhiteNits`, primaries — live in `ShaderLabEffectDescriptor::hiddenDefaults` without any `_hidden` suffix, and are kept off the UI by the customEffect declared-parameter filter. The Working Space node + property bindings is the only path for tracking the active display profile.)
 - **Analysis outputs**: Compute shader analysis effects declare `AnalysisFieldDef` entries that describe their output fields (name, type, count). These are read back to CPU via `GraphEvaluator` and can be bound to downstream properties.
 

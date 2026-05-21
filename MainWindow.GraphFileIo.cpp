@@ -888,10 +888,14 @@ namespace winrt::ShaderLab::implementation
         // Close all existing output windows.
         m_outputWindows.clear();
 
-        m_nodeGraphController.SetGraph(&m_graph);
-
-        // Restore isClock flag from ShaderLab effect descriptors
-        // (not serialized in JSON, derived from effect definition).
+        // Restore isClock flag from ShaderLab effect descriptors BEFORE
+        // SetGraph triggers a layout pass. The flag isn't serialized in
+        // JSON (it's derived from the effect definition), so a freshly-
+        // deserialized Clock node has isClock=false. RebuildLayout reads
+        // node.isClock to decide whether to allocate space for the
+        // play/pause button + progress bar; if it runs first the visual
+        // ends up sized as a regular parameter node and the controls
+        // never appear until something else triggers another layout.
         {
             auto& lib = ::ShaderLab::Effects::ShaderLabEffects::Instance();
             for (auto& node : const_cast<std::vector<::ShaderLab::Graph::EffectNode>&>(m_graph.Nodes()))
@@ -904,6 +908,8 @@ namespace winrt::ShaderLab::implementation
                 }
             }
         }
+
+        m_nodeGraphController.SetGraph(&m_graph);
 
         m_graph.MarkAllDirty();
         PopulatePreviewNodeSelector();

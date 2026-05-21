@@ -17,7 +17,7 @@ ShaderLab/
 ├── CHANGELOG.md                    # Version history
 ├── Bootstrap.ps1                   # One-command fresh-clone setup (cert + ExprTk + restore)
 │
-├── pch.h / pch.cpp                 # App PCH (WinRT, WinUI, D2D, D3D, Win2D, STL)
+├── pch.h / pch.cpp                 # App PCH (WinRT, WinUI, D2D, D3D, STL)
 ├── pch_engine.h / pch_engine.cpp   # Engine/Test/Headless PCH (WinRT base, D2D, D3D, MF, STL)
 ├── App.xaml / .h / .cpp            # Application entry point
 ├── MainWindow.xaml / .h / .cpp     # Main window layout + initialization (~4700 lines)
@@ -63,8 +63,8 @@ ShaderLab/
 │   ├── IccProfileParser.h / .cpp   # mscms.dll-based ICC reader
 │   ├── PipelineFormat.h            # PipelineFormat struct (scRGB FP16 always)
 │   ├── RenderEngine.h / .cpp       # App-only D3D11 + D2D1 + swap chain lifecycle
+│   ├── RenderThreadDispatcher.h    # Closure queue for UI → render-worker marshalling (P7)
 │   ├── GraphEvaluator.h / .cpp     # Topological walk, effect cache, dirty gating, D3D11 dispatch
-    │   ├── D3D11ComputeRunner.h / .cpp # Generic D3D11 compute dispatch for user shaders
 │   ├── D3D11ComputeRunner.h / .cpp # Generic D3D11 compute dispatch for user shaders
 │   ├── PixelReadback.h / .cpp      # Engine helper: FP32 RGBA region readback
 │   ├── CaptureNode.h / .cpp        # Engine helper: D2D + WIC PNG encode of any node's output
@@ -72,9 +72,8 @@ ShaderLab/
 │   ├── MathExpression.h / .cpp     # ExprTk-backed expression evaluator (PCH disabled on .cpp)
 │
 ├── Effects/                        # Engine: built-in effect wrappers + custom effect base
-│   ├── ShaderLabEffects.h / .cpp   # 20+ ShaderLab effects (versioned) — embedded HLSL
+│   ├── ShaderLabEffects.h / .cpp   # 35 ShaderLab effects (versioned) — embedded HLSL
 │   ├── ColorMath.cpp               # Shared HLSL color math library (extracted from ShaderLabEffects)
-    │   ├── ShaderLabEffects.h / .cpp   # 20+ ShaderLab effects (versioned) — embedded HLSL
 │   ├── PropertyMetadata.h          # Effect property metadata for UI generation
 │   ├── ImageLoader.h / .cpp        # WIC HDR/SDR image loading
 │   ├── SourceNodeFactory.h / .cpp  # Source node creation (image / video / flood / DXGI / WGC) + per-frame tick
@@ -82,12 +81,16 @@ ShaderLab/
 │   ├── ShaderCompiler.h / .cpp     # D3DCompile + D3DReflect wrapper
 │   ├── CustomPixelShaderEffect.h / .cpp     # ID2D1EffectImpl + ID2D1DrawTransform for user pixel shaders
 │   ├── CustomComputeShaderEffect.h / .cpp   # ID2D1EffectImpl + ID2D1ComputeTransform for user D2D compute
+│   ├── CustomComputeBridgeEffect.h / .cpp   # D2D wrapper for D3D11 compute (Phase 8 unifies discovery)
+│   ├── BytecodeCache.h / .cpp      # Compile-once bytecode store + disk LRU cache
+│   ├── IEngineComputeOutput.h      # COM interface for compute effects exposing GPU-resident SRVs
 │   ├── DxgiDuplicationSourceProvider.h / .cpp        # Live-capture provider for DXGI Desktop Duplication
 │   ├── VideoSourceProvider.h / .cpp                  # Media Foundation video decode + frame upload
 │   └── WindowsGraphicsCaptureSourceProvider.h / .cpp # Live-capture provider for the WinUI graphics-capture picker (app-side)
 │
 ├── Controls/                       # App-only: UI controllers (decoupled from XAML views)
 │   ├── OutputWindow.h / .cpp           # Per-Output-node OS window (independent SwapChainPanel)
+│   ├── OutputSinkRenderState.h         # Cross-thread sink for output windows (UI ↔ render worker, P12)
 │   ├── ShaderEditorController.h / .cpp # HLSL compile + D3DReflect auto-property generation
 │   ├── NodeGraphController.h / .cpp    # Canvas node graph editor (D2D bezier edges, hit-test, pan/zoom)
 │   ├── PixelInspectorController.h / .cpp # GPU readback (1×1 D2D1Bitmap1 → scRGB / sRGB / PQ / luminance)

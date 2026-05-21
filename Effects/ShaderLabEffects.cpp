@@ -37,26 +37,41 @@ namespace ShaderLab::Effects
     // -----------------------------------------------------------------------
 
     static const std::string s_luminanceHeatmapHLSL = R"HLSL(
-// Luminance Heatmap - false-color visualization of luminance
-Texture2D Source : register(t0);
+// Luminance Heatmap -- D3D11 compute, false-color luminance visualization.
+// MinNits / MaxNits are gpuBindable so a Luminance Statistics .Min / .Max
+// can drive the heatmap range automatically per source-distribution
+// without a CPU readback round-trip.
+#include "shaderlab_params.hlsli"
+
+Texture2D<float4>        Source      : register(t0);
+RWTexture2D<float4>      ImageOutput : register(u1);
+
+SHADERLAB_GPU_BUFFER(MinNits, t1)
+SHADERLAB_GPU_BUFFER(MaxNits, t2)
 
 cbuffer constants : register(b0) {
-    float MinNits;     // default 0.0
-    float MaxNits;     // default 10000.0
-    uint ColormapMode; // 0=Turbo, 1=Inferno
+    uint  Width;
+    uint  Height;
+    SHADERLAB_PARAM(float, MinNits)     // default 0.0
+    SHADERLAB_PARAM(float, MaxNits)     // default 10000.0
+    uint  ColormapMode;                 // 0=Turbo, 1=Inferno
 };
 
-float4 main(
-    float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
 {
-    float4 color = Source.Load(int3(uv0.xy, 0));
+    if (dtid.x >= Width || dtid.y >= Height) return;
+
+    SHADERLAB_LOAD_PARAM(float, MinNits)
+    SHADERLAB_LOAD_PARAM(float, MaxNits)
+
+    float4 color = Source.Load(int3(dtid.xy, 0));
     float nits = ScRGBLuminanceNits(color.rgb);
     float t = saturate((nits - MinNits) / max(MaxNits - MinNits, 0.001));
     float3 mapped = TurboColormap(t);
-    // Turbo colormap outputs perceptual 0-1 values.
-    // Keep as-is in scRGB (1.0 = 80 nits SDR white) for visible display.
-    return float4(mapped, color.a);
+    // Turbo colormap outputs perceptual 0-1 values; keep in scRGB
+    // (1.0 = 80 nits SDR white) for visible display.
+    ImageOutput[dtid.xy] = float4(mapped, color.a);
 }
 )HLSL";
 
@@ -137,10 +152,13 @@ float4 main(
 )HLSL";
 
     static const std::string s_luminanceHighlightHLSL = R"HLSL(
-// Luminance Highlight
-// Mirrors Gamut Highlight: pixels whose luminance falls outside the
-// active nit range (or inside, depending on Mode) are tinted with an
-// overlay color.
+// Luminance Highlight -- D3D11 compute, mirrors Gamut Highlight but on
+// luminance. Pixels whose luminance falls outside (or inside, per Mode)
+// the active nit range are tinted with an overlay color.
+//
+// MinNits / MaxNits are gpuBindable so a Luminance Statistics .Min / .Max
+// (or Working Space.MinNits / .PeakNits) can drive the range
+// automatically without a CPU readback round-trip.
 //
 // TargetRange selects the [min,max] nit window:
 //   0 = SDR              (0 .. 80 nits)
@@ -148,28 +166,38 @@ float4 main(
 //   2 = HDR 1000         (0 .. 1000 nits)
 //   3 = HDR 4000         (0 .. 4000 nits)
 //   4 = HDR 10000        (0 .. 10000 nits)
-//   5 = Custom           (use MinNits / MaxNits sliders directly; bind
-//                         to `Working Space.MinNits/PeakNits` for
-//                         monitor-matched analysis.)
-Texture2D Source : register(t0);
+//   5 = Custom           (use MinNits / MaxNits sliders directly)
+#include "shaderlab_params.hlsli"
+
+Texture2D<float4>        Source      : register(t0);
+RWTexture2D<float4>      ImageOutput : register(u1);
+
+SHADERLAB_GPU_BUFFER(MinNits, t1)
+SHADERLAB_GPU_BUFFER(MaxNits, t2)
 
 cbuffer constants : register(b0) {
-    uint TargetRange;
-    float MinNits;
-    float MaxNits;
+    uint  Width;
+    uint  Height;
+    uint  TargetRange;
+    SHADERLAB_PARAM(float, MinNits)
+    SHADERLAB_PARAM(float, MaxNits)
     float OverlayR;
     float OverlayG;
     float OverlayB;
     float OverlayStrength;
-    uint Mode; // 0 = Out-of-Range, 1 = In-Range
+    uint  Mode;                  // 0 = Out-of-Range, 1 = In-Range
 };
 
-float4 main(
-    float4 pos : SV_POSITION,
-    float4 uv0 : TEXCOORD0) : SV_TARGET
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
 {
-    float4 color = Source.Load(int3(uv0.xy, 0));
-    if (color.a < 0.001) return color;
+    if (dtid.x >= Width || dtid.y >= Height) return;
+
+    SHADERLAB_LOAD_PARAM(float, MinNits)
+    SHADERLAB_LOAD_PARAM(float, MaxNits)
+
+    float4 color = Source.Load(int3(dtid.xy, 0));
+    if (color.a < 0.001) { ImageOutput[dtid.xy] = color; return; }
 
     // ScRGBLuminanceNits: scRGB luminance * 80 (1.0 = 80 nits SDR white).
     float nits = ScRGBLuminanceNits(color.rgb);
@@ -192,14 +220,13 @@ float4 main(
         effMax = MaxNits;
     }
 
-    // Defensive: degenerate range collapses to "everything out-of-range".
     bool outOfRange = (effMin >= effMax) || (nits < effMin) || (nits > effMax);
     bool highlight = (Mode > 0.5) ? !outOfRange : outOfRange;
     if (highlight) {
         float3 overlay = float3(OverlayR, OverlayG, OverlayB);
         color.rgb = lerp(color.rgb, overlay, OverlayStrength);
     }
-    return color;
+    ImageOutput[dtid.xy] = color;
 }
 )HLSL";
 
@@ -307,19 +334,24 @@ float4 main(
         const auto& colorMath = GetColorMathHLSL();
 
         // ---- Luminance Heatmap ----
+        // D3D11 compute -- MinNits / MaxNits gpuBindable.
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Heatmap";
-            desc.effectId = L"Luminance Heatmap"; desc.effectVersion = 2;
+            desc.effectId = L"Luminance Heatmap"; desc.effectVersion = 3;
             desc.category = L"Analysis";
             desc.subcategory = L"Highlights";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + s_luminanceHeatmapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"MinNits",      L"float", 0.0f,    0.0f, 10000.0f, 1.0f },
-                { L"MaxNits",      L"float", 10000.0f, 0.0f, 10000.0f, 100.0f },
-                { L"ColormapMode", L"float", 0.0f, 0.0f, 1.0f, 1.0f, { L"Turbo", L"Inferno" } },
+                Graph::ParameterDefinition{ L"MinNits",      L"float",     0.0f,    0.0f, 10000.0f,    1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"MaxNits",      L"float", 10000.0f,    0.0f, 10000.0f,  100.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"ColormapMode", L"float",     0.0f,    0.0f,     1.0f,    1.0f, { L"Turbo", L"Inferno" } },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -363,18 +395,22 @@ float4 main(
         {
             ShaderLabEffectDescriptor desc;
             desc.name = L"Luminance Highlight";
-            desc.effectId = L"Luminance Highlight"; desc.effectVersion = 5;
+            desc.effectId = L"Luminance Highlight"; desc.effectVersion = 6;
             desc.category = L"Analysis";
             desc.subcategory = L"Highlights";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + s_luminanceHighlightHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
                 { L"TargetRange",     L"float", 0.0f,   0.0f, 5.0f, 1.0f,
                     { L"SDR (0-80)", L"HDR 400", L"HDR 1000", L"HDR 4000",
                       L"HDR 10000", L"Custom" } },
-                { L"MinNits",         L"float", 0.0f,    0.0f, 10000.0f, 1.0f, {}, L"TargetRange == 5" },
-                { L"MaxNits",         L"float", 1000.0f, 0.0f, 10000.0f, 10.0f, {}, L"TargetRange == 5" },
+                Graph::ParameterDefinition{ L"MinNits",   L"float",    0.0f, 0.0f, 10000.0f,  1.0f, {}, L"TargetRange == 5", true },
+                Graph::ParameterDefinition{ L"MaxNits",   L"float", 1000.0f, 0.0f, 10000.0f, 10.0f, {}, L"TargetRange == 5", true },
                 { L"OverlayR",        L"float", 1.0f,   0.0f, 1.0f, 0.01f },
                 { L"OverlayG",        L"float", 0.0f,   0.0f, 1.0f, 0.01f },
                 { L"OverlayB",        L"float", 1.0f,   0.0f, 1.0f, 0.01f },
@@ -1065,20 +1101,22 @@ float4 main(
         // ---- Delta E Comparator ----
         {
             static const std::string deltaEHLSL = R"HLSL(
-// Delta E Comparator - per-pixel color difference between two inputs
-// Supports: CIE76, CIE94, CIEDE2000
+// Delta E Comparator -- D3D11 compute, per-pixel color difference between
+// two inputs (Reference at t0, Test at t1). Supports CIE76, CIE94, CIEDE2000.
+
+Texture2D<float4>   Reference   : register(t0);
+Texture2D<float4>   Test        : register(t1);
+RWTexture2D<float4> ImageOutput : register(u1);
 
 cbuffer Constants : register(b0)
 {
-    uint Method;     // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
-    float Scale;      // Multiplier for visualization (higher = more sensitive)
-    float MaxDeltaE;  // Clamp for colormap (dE at this value = full red)
-    uint OutputMode; // 0 = Heatmap (Turbo colormap), 1 = Grayscale dE / MaxDeltaE
+    uint  Width;
+    uint  Height;
+    uint  Method;        // 0 = CIE76, 1 = CIE94, 2 = CIEDE2000
+    float Scale;         // visualization multiplier
+    float MaxDeltaE;     // clamp for colormap (dE >= this = full red)
+    uint  OutputMode;    // 0 = Heatmap (Turbo), 1 = Grayscale dE / MaxDeltaE
 };
-
-Texture2D InputTexture : register(t0);   // Reference
-Texture2D InputTexture1 : register(t1);  // Test
-SamplerState InputSampler : register(s0);
 
 // CIE76: simple Euclidean distance in L*a*b*
 float DeltaE76(float3 lab1, float3 lab2) {
@@ -1176,15 +1214,13 @@ float DeltaE2000(float3 lab1, float3 lab2) {
     return sqrt(t1*t1 + t2*t2 + t3*t3 + RT * t2 * t3);
 }
 
-float4 main(
-    float4 pos      : SV_POSITION,
-    float4 posScene : SCENE_POSITION,
-    float4 uv0      : TEXCOORD0,
-    float4 uv1      : TEXCOORD1
-) : SV_Target
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
 {
-    float4 ref  = InputTexture.Sample(InputSampler, uv0.xy);
-    float4 test = InputTexture1.Sample(InputSampler, uv1.xy);
+    if (dtid.x >= Width || dtid.y >= Height) return;
+
+    float4 ref  = Reference.Load(int3(dtid.xy, 0));
+    float4 test = Test.Load(int3(dtid.xy, 0));
 
     float3 labRef  = ScRGBToLab(ref.rgb);
     float3 labTest = ScRGBToLab(test.rgb);
@@ -1196,34 +1232,36 @@ float4 main(
     else                  dE = DeltaE76(labRef, labTest);
 
     dE *= Scale;
-
-    // Always read OutputMode unconditionally so D3DCompile can't strip it
-    // (gotcha #2 in CLAUDE.md). Branch on the read value below.
     float mode = OutputMode;
-
-    // Map to colormap: 0 = black (exact match), MaxDeltaE = full red.
     float t = saturate(dE / max(MaxDeltaE, 0.01));
 
+    float4 outColor;
     if (mode > 0.5)
     {
-        // Grayscale dE: gray = saturate(dE / MaxDeltaE), output to RGB.
-        // This makes mean(R) directly readable as fractional dE — a
-        // downstream Luminance Statistics node yields live mean/p95/max
-        // dE values without needing CPU readback of every pixel.
-        return float4(t, t, t, 1.0);
+        // Grayscale dE: a downstream Luminance Statistics node yields
+        // live mean/p95/max dE values without needing CPU readback of
+        // every pixel.
+        outColor = float4(t, t, t, 1.0);
     }
-
-    float3 color = TurboColormap(t) * smoothstep(0.0, 0.02, t);
-    return float4(color, 1.0);
+    else
+    {
+        float3 color = TurboColormap(t) * smoothstep(0.0, 0.02, t);
+        outColor = float4(color, 1.0);
+    }
+    ImageOutput[dtid.xy] = outColor;
 }
 )HLSL";
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Delta E Comparator";
-            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 5;
+            desc.effectId = L"Delta E Comparator"; desc.effectVersion = 6;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + deltaEHLSL;
             desc.inputNames = { L"Reference", L"Test" };
             desc.parameters = {
@@ -2224,49 +2262,66 @@ void main(uint3 dtid : SV_DispatchThreadID)
         // ---- ICtCp Inverse Tone Map (SDR -> HDR) ----
         // Inverse Reinhard on I; expands SDR-anchored content into the
         // HDR peak. Mirror of ICtCp Tone Map; Ct/Cp unchanged.
+        // D3D11 compute -- SourcePeakNits + TargetPeakNits gpuBindable.
         {
             static const std::string ictcpInverseToneMapHLSL = R"HLSL(
-// ICtCp Inverse Tone Map (SDR -> HDR), I-channel inverse Reinhard
-Texture2D Source : register(t0);
-SamplerState Sampler : register(s0);
+// ICtCp Inverse Tone Map (SDR -> HDR) -- D3D11 compute, I-channel inverse Reinhard.
+#include "shaderlab_params.hlsli"
+
+Texture2D<float4>        Source      : register(t0);
+RWTexture2D<float4>      ImageOutput : register(u1);
+
+SHADERLAB_GPU_BUFFER(SourcePeakNits, t1)
+SHADERLAB_GPU_BUFFER(TargetPeakNits, t2)
 
 cbuffer constants : register(b0) {
-    float SourcePeakNits;        // SDR source peak (e.g. 80, 203)
-    float TargetPeakNits;        // typical 1000-10000
-    float Strength;              // 0..1 lerp from identity to expanded
+    uint   Width;
+    uint   Height;
+    SHADERLAB_PARAM(float, SourcePeakNits)        // SDR source peak (e.g. 80, 203)
+    SHADERLAB_PARAM(float, TargetPeakNits)        // typical 1000-10000
+    float  Strength;                              // 0..1 lerp from identity to expanded
 };
 
-float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
 {
-    float4 color = Source.Load(int3(uv, 0));
+    if (dtid.x >= Width || dtid.y >= Height) return;
+
+    SHADERLAB_LOAD_PARAM(float, SourcePeakNits)
+    SHADERLAB_LOAD_PARAM(float, TargetPeakNits)
+
+    float4 color = Source.Load(int3(dtid.xy, 0));
     float3 ictcp = ScRGBToICtCp(color.rgb);
 
     // Inverse of ReinhardCompressI(x, peakIn=HDR, peakOut=SDR):
     // for SDR -> HDR expansion we feed the *compressed* (SDR) range as
-    // peakOut and the *expanded* (HDR) range as peakIn. The input I lives
-    // in [0, peakOut_I] (SDR range) and the helper returns an I in
-    // [0, peakIn_I] (HDR range).
+    // peakOut and the *expanded* (HDR) range as peakIn. Input I lives in
+    // [0, sdrI] (SDR range); the helper returns I in [0, hdrI] (HDR).
     float sdrI = NitsToI(SourcePeakNits);
     float hdrI = NitsToI(TargetPeakNits);
     float expanded = ReinhardExpandI(ictcp.x, hdrI, sdrI);
     ictcp.x = lerp(ictcp.x, expanded, saturate(Strength));
 
     float3 outRgb = ICtCpToScRGB(ictcp);
-    return float4(outRgb, color.a);
+    ImageOutput[dtid.xy] = float4(outRgb, color.a);
 }
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Inverse Tone Map (SDR -> HDR)";
-            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 10;
+            desc.effectId = L"ICtCp Inverse Tone Map"; desc.effectVersion = 11;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + ictcpInverseToneMapHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"SourcePeakNits", L"float", 203.0f, 80.0f, 500.0f, 1.0f },
-                { L"TargetPeakNits", L"float", 1000.0f, 100.0f, 10000.0f, 50.0f },
-                { L"Strength",       L"float", 1.0f, 0.0f, 1.0f, 0.05f },
+                Graph::ParameterDefinition{ L"SourcePeakNits", L"float",  203.0f,   80.0f,   500.0f,  1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"TargetPeakNits", L"float", 1000.0f,  100.0f, 10000.0f, 50.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"Strength",       L"float",    1.0f,    0.0f,     1.0f, 0.05f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2317,25 +2372,40 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
         // multiplier ramps from 1 toward (1 - Amount); above PeakNits
         // the saturation is fully attenuated. Pairs naturally with
         // ICtCp Tone Map: tone-map first, then desat the highlights.
+        // D3D11 compute -- KneeNits + PeakNits gpuBindable (typical
+        // bindings: LumStats.P95 -> KneeNits, LumStats.Max -> PeakNits).
         {
             static const std::string ictcpHighlightDesatHLSL = R"HLSL(
-// ICtCp Highlight Desaturation — smooth Ct/Cp rolloff vs. I
-Texture2D Source : register(t0);
-SamplerState Sampler : register(s0);
+// ICtCp Highlight Desaturation -- D3D11 compute, smooth Ct/Cp rolloff vs. I.
+#include "shaderlab_params.hlsli"
+
+Texture2D<float4>        Source      : register(t0);
+RWTexture2D<float4>      ImageOutput : register(u1);
+
+SHADERLAB_GPU_BUFFER(KneeNits, t1)
+SHADERLAB_GPU_BUFFER(PeakNits, t2)
 
 cbuffer constants : register(b0) {
-    float KneeNits;     // start of the rolloff (e.g. 200)
-    float PeakNits;     // end of the rolloff       (e.g. 1000)
-    float Amount;       // [0..1], how far to desaturate at peak (1 = grayscale at peak)
+    uint  Width;
+    uint  Height;
+    SHADERLAB_PARAM(float, KneeNits)    // start of the rolloff (e.g. 200)
+    SHADERLAB_PARAM(float, PeakNits)    // end of the rolloff   (e.g. 1000)
+    float Amount;                       // [0..1] how far to desaturate at peak
 };
 
-float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
 {
-    float4 color = Source.Load(int3(uv, 0));
+    if (dtid.x >= Width || dtid.y >= Height) return;
+
+    SHADERLAB_LOAD_PARAM(float, KneeNits)
+    SHADERLAB_LOAD_PARAM(float, PeakNits)
+
+    float4 color = Source.Load(int3(dtid.xy, 0));
     float3 ictcp = ScRGBToICtCp(color.rgb);
 
-    // Map I (PQ) back to nits so the user's parameters mean what they say
-    // even though the I axis is non-linear.
+    // Map I (PQ) back to nits so the user's parameters mean what they
+    // say even though the I axis is non-linear.
     float nits = IToNits(ictcp.x);
     float t = saturate((nits - KneeNits) / max(PeakNits - KneeNits, 1e-3));
     float scale = 1.0 - saturate(Amount) * smoothstep(0.0, 1.0, t);
@@ -2343,21 +2413,25 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
     ictcp.y *= scale;
     ictcp.z *= scale;
     float3 outRgb = ICtCpToScRGB(ictcp);
-    return float4(outRgb, color.a);
+    ImageOutput[dtid.xy] = float4(outRgb, color.a);
 }
 )HLSL";
             ShaderLabEffectDescriptor desc;
             desc.name = L"ICtCp Highlight Desaturation";
-            desc.effectId = L"ICtCp Highlight Desaturation"; desc.effectVersion = 3;
+            desc.effectId = L"ICtCp Highlight Desaturation"; desc.effectVersion = 4;
             desc.category = L"Analysis";
             desc.subcategory = L"Tone Mapping";
-            desc.shaderType = Graph::CustomShaderType::PixelShader;
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
             desc.hlslSource = colorMath + ictcpHighlightDesatHLSL;
             desc.inputNames = { L"Source" };
             desc.parameters = {
-                { L"KneeNits",       L"float", 200.0f,  10.0f, 5000.0f, 10.0f },
-                { L"PeakNits",       L"float", 1000.0f, 50.0f, 10000.0f, 50.0f },
-                { L"Amount",         L"float", 1.0f,    0.0f,  1.0f,    0.05f },
+                Graph::ParameterDefinition{ L"KneeNits", L"float",  200.0f, 10.0f,  5000.0f, 10.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"PeakNits", L"float", 1000.0f, 50.0f, 10000.0f, 50.0f, {}, L"", true },
+                { L"Amount",       L"float",    1.0f,  0.0f,     1.0f, 0.05f },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -2381,9 +2455,16 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_Target
 // diagonal line.
 //
 // LineWidth controls the dividing line thickness in pixels.
+//
+// Inputs of mismatched dimensions are stretched to the union output rect
+// via normalized-UV Sample() (linear-filtered) -- so feeding e.g. a
+// 4K source on ImageA and a 1080p tone-mapped result on ImageB still
+// fills both halves of the wipe, instead of returning black for any
+// out-of-bounds Load on the smaller input.
 
 Texture2D ImageA : register(t0);
 Texture2D ImageB : register(t1);
+SamplerState LinearSampler : register(s0);
 
 cbuffer Constants : register(b0)
 {
@@ -2392,27 +2473,52 @@ cbuffer Constants : register(b0)
     float Angle;           // degrees; 0 = horizontal wipe (vertical line),
                            // 90 = vertical wipe (horizontal line),
                            // 45 = top-left-to-bottom-right diagonal
-    float OutputW;         // host-injected: actual output rect width in
-                           // pixels. Cant use Texture2D::GetDimensions()
-                           // because D2D pads intermediates to atlas
-                           // allocation sizes (typically 4096x4096).
-    float OutputH;         // host-injected: actual output rect height.
+    float OutputW;         // host-injected: union of input *content* widths
+    float OutputH;         // host-injected: union of input *content* heights
+    // Per-input content dimensions. D2D pixel-shader inputs live inside
+    // atlas allocations that are larger than the actual content rect (e.g.
+    // 1920x1080 content in a 4096x4096 atlas). [0,1] UV with Sample() maps
+    // to the full atlas, so we have to scale by content/atlas to land on
+    // the content sub-rect.
+    float ImageAW;
+    float ImageAH;
+    float ImageBW;
+    float ImageBH;
 };
 
 float4 main(
     float4 pos : SV_POSITION,
     float4 uv0 : TEXCOORD0) : SV_TARGET
 {
-    float4 a = ImageA.Load(int3(uv0.xy, 0));
-    float4 b = ImageB.Load(int3(uv0.xy, 0));
-
     // Use the host-supplied output dimensions, not GetDimensions(), since
     // D2D pads input textures to atlas allocation sizes (e.g. 4096x4096
     // when the actual output rect is 3840x2160). uv0 is in true pixel
-    // coords thanks to D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING; we just need
-    // the matching output-rect dimensions to recenter on.
+    // coords thanks to D2D1_PIXEL_OPTIONS_TRIVIAL_SAMPLING.
     float W = max(OutputW, 1.0);
     float H = max(OutputH, 1.0);
+
+    // Sample each input through its own atlas-aware UV. Logic:
+    //   uvNormOutput = uv0 / (W,H)              -> [0,1] across the wipe canvas
+    //   contentUV    = uvNormOutput * contentSize  -> pixel coords within
+    //                                                 the input's content rect
+    //   atlasUV      = contentUV / atlasSize    -> [0..content/atlas] within
+    //                                                 the actual D2D texture
+    // For exactly-sized inputs (compute outputs) atlas == content so atlasUV
+    // is the simple [0,1] mapping. For atlas-padded inputs (D2D pixel-shader
+    // outputs), atlas > content so atlasUV is < 1 and stays within content.
+    float2 atlasA, atlasB;
+    ImageA.GetDimensions(atlasA.x, atlasA.y);
+    ImageB.GetDimensions(atlasB.x, atlasB.y);
+    atlasA = max(atlasA, float2(1.0, 1.0));
+    atlasB = max(atlasB, float2(1.0, 1.0));
+
+    float2 uvA = uv0.xy * float2(max(ImageAW, 1.0), max(ImageAH, 1.0))
+               / (float2(W, H) * atlasA);
+    float2 uvB = uv0.xy * float2(max(ImageBW, 1.0), max(ImageBH, 1.0))
+               / (float2(W, H) * atlasB);
+
+    float4 a = ImageA.Sample(LinearSampler, uvA);
+    float4 b = ImageB.Sample(LinearSampler, uvB);
 
     // Direction vector along which we project pixel positions.
     float radians = Angle * 3.14159265 / 180.0;
@@ -2443,7 +2549,7 @@ float4 main(
 
             ShaderLabEffectDescriptor desc;
             desc.name = L"Split Comparison";
-            desc.effectId = L"Split Comparison"; desc.effectVersion = 5;
+            desc.effectId = L"Split Comparison"; desc.effectVersion = 6;
             desc.category = L"Analysis";
             desc.subcategory = L"Comparison";
             desc.shaderType = Graph::CustomShaderType::PixelShader;
@@ -2453,10 +2559,15 @@ float4 main(
                 { L"SplitPosition", L"float",   0.5f,    0.0f,   1.0f,  0.01f },
                 { L"LineWidth",     L"float",   2.0f,    0.0f,  10.0f,  0.5f },
                 { L"Angle",         L"float",   0.0f, -360.0f, 360.0f,  1.0f },
-                // Hidden: host writes actual output-rect dimensions
-                // each frame (see GraphEvaluator's pixel-shader eval).
+                // Hidden: host writes actual output-rect dimensions and
+                // per-input content dimensions every frame (see
+                // GraphEvaluator's pixel-shader eval).
                 Graph::ParameterDefinition{ L"OutputW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
                 Graph::ParameterDefinition{ L"OutputH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"ImageAW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"ImageAH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"ImageBW", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
+                Graph::ParameterDefinition{ L"ImageBH", L"float", 1.0f, 1.0f, 16384.0f, 1.0f, {}, L"", true },
             };
             m_effects.push_back(std::move(desc));
         }
@@ -3096,6 +3207,238 @@ void main(uint3 GTid : SV_GroupThreadID)
             desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
             desc.analysisFields = {
                 { L"Result", Graph::AnalysisFieldType::Float },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- ShaderLab Scale (Resampling) ----
+        // D3D11 compute scale effect with filter algorithms beyond what D2D's
+        // CLSID_D2D1Scale natively offers (Lanczos-3, Mitchell-Netravali,
+        // Catmull-Rom, Box / area, Gaussian). Useful as a hand-inserted
+        // resolution cap in heavy graphs: insert between Source and the
+        // visual branch and the entire downstream chain renders at the
+        // smaller resolution.
+        //
+        // Output dimensions are explicitly OutputWidth + OutputHeight. To
+        // drive them from source dimensions, add an Image Info node on the
+        // same input and route ImageInfo.Width / .Height through Numeric
+        // Expression nodes (e.g. expr "A * 0.5") into Scale.OutputWidth /
+        // .OutputHeight.
+        //
+        // OutputWidth = 0 or OutputHeight = 0 falls back to the source's
+        // bounds (no scaling).
+        {
+            static const std::string scaleHLSL = R"HLSL(
+// ShaderLab Scale -- D3D11 compute resampler with multi-tap filters.
+// Output pixel (x,y) reads a windowed neighborhood around the corresponding
+// source location and combines the samples with the chosen kernel.
+
+Texture2D<float4>   Source      : register(t0);
+RWTexture2D<float4> ImageOutput : register(u1);
+
+cbuffer constants : register(b0) {
+    uint  Width;          // source dims (auto-injected from input #0)
+    uint  Height;
+    uint  OutputWidth;    // 0 = pass-through (= source Width)
+    uint  OutputHeight;   // 0 = pass-through (= source Height)
+    uint  FilterMode;     // 0=Bilinear 1=CatmullRom 2=Mitchell 3=Lanczos3 4=Box 5=Gaussian
+};
+
+// ---- Filter kernels (1D weights; separable for 2D) ---------------------
+
+float W_bilinear(float t) { return max(0.0, 1.0 - abs(t)); }
+
+float W_catmullrom(float t) {
+    t = abs(t);
+    if (t < 1.0) return  1.5*t*t*t - 2.5*t*t + 1.0;
+    if (t < 2.0) return -0.5*t*t*t + 2.5*t*t - 4.0*t + 2.0;
+    return 0.0;
+}
+
+// Mitchell-Netravali B=1/3, C=1/3 -- balanced sharpness/ringing default.
+float W_mitchell(float t) {
+    t = abs(t);
+    const float B = 1.0/3.0, C = 1.0/3.0;
+    if (t < 1.0) {
+        return ((12.0 - 9.0*B - 6.0*C)*t*t*t
+              + (-18.0 + 12.0*B + 6.0*C)*t*t
+              + (6.0 - 2.0*B)) / 6.0;
+    }
+    if (t < 2.0) {
+        return ((-B - 6.0*C)*t*t*t
+              + (6.0*B + 30.0*C)*t*t
+              + (-12.0*B - 48.0*C)*t
+              + (8.0*B + 24.0*C)) / 6.0;
+    }
+    return 0.0;
+}
+
+float W_lanczos3(float t) {
+    t = abs(t);
+    if (t < 1e-5) return 1.0;
+    if (t >= 3.0) return 0.0;
+    float pt = 3.14159265 * t;
+    return 3.0 * sin(pt) * sin(pt / 3.0) / (pt * pt);
+}
+
+float W_box(float t, float halfWidth) {
+    return abs(t) <= halfWidth ? 1.0 : 0.0;
+}
+
+float W_gauss(float t) {
+    // sigma = 0.5 -- tight kernel. Effective radius widens with downscale
+    // ratio via the support multiplier in main().
+    return exp(-(t*t) * 2.0);   // = exp(-t^2 / (2*0.5^2))
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 dtid : SV_DispatchThreadID)
+{
+    // Pass-through when OutputWidth/Height not set: act as identity.
+    uint outW = (OutputWidth  > 0) ? OutputWidth  : Width;
+    uint outH = (OutputHeight > 0) ? OutputHeight : Height;
+    if (dtid.x >= outW || dtid.y >= outH) return;
+
+    // Output pixel center -> source-pixel-center coords.
+    float2 outCenter = float2(dtid.xy) + 0.5;
+    float2 outSize   = float2(outW, outH);
+    float2 srcSize   = float2(Width, Height);
+    float2 ratio     = srcSize / outSize;             // src per dst pixel
+    float2 srcCenter = outCenter * ratio - 0.5;
+
+    // For downscale (ratio > 1) we widen the kernel by the ratio so the
+    // filter integrates over the *destination footprint* in source pixels;
+    // otherwise samples alias. For upscale (ratio < 1) we keep support = 1.
+    float2 support = max(ratio, float2(1.0, 1.0));
+
+    // Per-mode base radius in kernel domain (half-width of the kernel).
+    uint mode = FilterMode;
+    float baseRadius = 1.0;
+    if      (mode == 1) baseRadius = 2.0;   // Catmull-Rom
+    else if (mode == 2) baseRadius = 2.0;   // Mitchell
+    else if (mode == 3) baseRadius = 3.0;   // Lanczos-3
+    else if (mode == 4) baseRadius = 0.5;   // Box (half-width)
+    else if (mode == 5) baseRadius = 2.0;   // Gaussian (truncated)
+
+    // Effective radius in source pixels after widening for downscale.
+    float2 effR = baseRadius * support;
+    int2   r    = int2(ceil(effR));
+    r = clamp(r, int2(1, 1), int2(12, 12));   // safety cap
+
+    int2 ic = int2(floor(srcCenter));
+
+    float4 sum  = float4(0, 0, 0, 0);
+    float  wsum = 0.0;
+
+    [loop]
+    for (int dy = -r.y; dy <= r.y; ++dy)
+    {
+        [loop]
+        for (int dx = -r.x; dx <= r.x; ++dx)
+        {
+            int2 sxy = clamp(ic + int2(dx, dy),
+                             int2(0, 0),
+                             int2(int(Width) - 1, int(Height) - 1));
+            float2 t = (float2(sxy) + 0.5 - srcCenter) / support;
+
+            float wx, wy;
+            if      (mode == 0) { wx = W_bilinear(t.x);   wy = W_bilinear(t.y); }
+            else if (mode == 1) { wx = W_catmullrom(t.x); wy = W_catmullrom(t.y); }
+            else if (mode == 2) { wx = W_mitchell(t.x);   wy = W_mitchell(t.y); }
+            else if (mode == 3) { wx = W_lanczos3(t.x);   wy = W_lanczos3(t.y); }
+            else if (mode == 4) { wx = W_box(t.x, 0.5);   wy = W_box(t.y, 0.5); }
+            else                { wx = W_gauss(t.x);      wy = W_gauss(t.y); }
+
+            float w = wx * wy;
+            sum  += Source.Load(int3(sxy, 0)) * w;
+            wsum += w;
+        }
+    }
+
+    ImageOutput[dtid.xy] = (wsum > 1e-6) ? (sum / wsum) : float4(0, 0, 0, 0);
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Scale";
+            desc.effectId = L"ShaderLab Scale"; desc.effectVersion = 1;
+            desc.category = L"Color";
+            desc.subcategory = L"Resampling";
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.hasImageOutput = true;
+            desc.threadGroupX = 8;
+            desc.threadGroupY = 8;
+            desc.threadGroupZ = 1;
+            desc.hlslSource = scaleHLSL;
+            desc.inputNames = { L"Source" };
+            desc.parameters = {
+                // OutputWidth / OutputHeight are the primary controls.
+                // 0 means "pass through at source dims". To drive them
+                // from source dimensions, bind from an Image Info node
+                // (see catalog) through a Numeric Expression.
+                { L"OutputWidth",  L"uint", 0.0f, 0.0f, 16384.0f, 1.0f },
+                { L"OutputHeight", L"uint", 0.0f, 0.0f, 16384.0f, 1.0f },
+                { L"FilterMode",   L"float", 3.0f, 0.0f, 5.0f, 1.0f,
+                    { L"Bilinear", L"Catmull-Rom Bicubic", L"Mitchell-Netravali",
+                      L"Lanczos-3", L"Box (Area)", L"Gaussian" } },
+            };
+            m_effects.push_back(std::move(desc));
+        }
+
+        // ---- Image Info ----
+        // Analysis-only compute that exposes its source's dimensions and a
+        // few derived quantities as typed analysis fields. The runner
+        // auto-injects Width / Height into the cbuffer based on the input
+        // texture; this shader just copies them into the result buffer
+        // alongside two convenience derivations.
+        //
+        // Composes naturally with Numeric Expression to drive parameters
+        // that should track the source -- e.g. ImageInfo.Width through
+        // "A * 0.5" into Scale.OutputWidth for a half-resolution pass.
+        {
+            static const std::string imageInfoHLSL = R"HLSL(
+// Image Info -- D3D11 compute, exposes source dims as analysis fields.
+
+Texture2D<float4>          Source : register(t0);
+RWStructuredBuffer<float4> Result : register(u0);
+
+cbuffer constants : register(b0) {
+    uint Width;
+    uint Height;
+};
+
+[numthreads(1, 1, 1)]
+void main()
+{
+    float w = float(Width);
+    float h = float(Height);
+    float aspect = (h > 0.5) ? (w / h) : 0.0;
+    float pixels = w * h;
+    // Each analysis field maps to its own Result[i].x slot.
+    Result[0] = float4(w,      0, 0, 0);   // Width
+    Result[1] = float4(h,      0, 0, 0);   // Height
+    Result[2] = float4(aspect, 0, 0, 0);   // AspectRatio
+    Result[3] = float4(pixels, 0, 0, 0);   // PixelCount
+}
+)HLSL";
+            ShaderLabEffectDescriptor desc;
+            desc.name = L"Image Info";
+            desc.effectId = L"Image Info"; desc.effectVersion = 1;
+            desc.category = L"Analysis";
+            desc.subcategory = L"Statistics";
+            desc.shaderType = Graph::CustomShaderType::D3D11ComputeShader;
+            desc.dataOnly = true;
+            desc.hasImageOutput = false;
+            desc.threadGroupX = 1;
+            desc.threadGroupY = 1;
+            desc.threadGroupZ = 1;
+            desc.hlslSource = imageInfoHLSL;
+            desc.inputNames = { L"Source" };
+            desc.analysisOutputType = Graph::AnalysisOutputType::Typed;
+            desc.analysisFields = {
+                { L"Width",       Graph::AnalysisFieldType::Float },
+                { L"Height",      Graph::AnalysisFieldType::Float },
+                { L"AspectRatio", Graph::AnalysisFieldType::Float },
+                { L"PixelCount",  Graph::AnalysisFieldType::Float },
             };
             m_effects.push_back(std::move(desc));
         }

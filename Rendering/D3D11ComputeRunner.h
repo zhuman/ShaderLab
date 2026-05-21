@@ -85,7 +85,7 @@ namespace ShaderLab::Rendering
         // SHADERLAB_GPU_BUFFER slots without a CPU readback round-trip.
         // Pass empty vectors for the no-binding case.
         std::vector<float> DispatchWithImageOutput(
-            ID3D11Texture2D* inputTexture,
+            const std::vector<ID3D11Texture2D*>& inputTextures,
             const std::vector<BYTE>& cbufferData,
             uint32_t resultCount,
             ID3D11Texture2D* imageOutputTexture,

@@ -243,7 +243,8 @@ float4 main(
 
     HRESULT STDMETHODCALLTYPE CustomComputeBridgeEffect::Dispatch(
         ID2D1DeviceContext5* dc,
-        ID2D1Image* inputImage,
+        ID2D1Image* const* inputImages,
+        UINT32 inputCount,
         const BYTE* cbufferData,
         UINT32 cbufferSize,
         UINT32 analysisFloat4Count,
@@ -251,128 +252,125 @@ float4 main(
         UINT32 imageOutputH,
         std::vector<float>* outAnalysisFloats)
     {
-        if (!dc || !inputImage) return E_INVALIDARG;
+        if (!dc || !inputImages || inputCount == 0 || !inputImages[0])
+            return E_INVALIDARG;
 
-        // Pre-render input to FP32 D3D11 texture. Mirrors the pre-Phase-8
-        // logic that lived inline in `GraphEvaluator::DispatchUserD3D11Compute`.
-        // 96 DPI keeps GetImageLocalBounds in pixels.
+        // Pre-render each input to its own FP32 D3D11 texture. 96 DPI
+        // keeps GetImageLocalBounds in pixels.
         float oldDpiX = 0, oldDpiY = 0;
         dc->GetDpi(&oldDpiX, &oldDpiY);
         dc->SetDpi(96.0f, 96.0f);
 
-        D2D1_RECT_F bounds{};
-        dc->GetImageLocalBounds(inputImage, &bounds);
-        UINT32 w = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
-        UINT32 h = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
-        if (w == 0 || h == 0)
-        {
-            dc->SetDpi(oldDpiX, oldDpiY);
-            return E_NOT_VALID_STATE;
-        }
+        if (m_inputBitmaps.size() < inputCount)
+            m_inputBitmaps.resize(inputCount);
 
-        winrt::com_ptr<ID2D1Bitmap1> inputBmp;
-        // Fast path: if `inputImage` is already an FP32-RGBA D2D bitmap
-        // of the correct size (e.g. produced by GraphEvaluator's
-        // PreRenderInputBitmap and shared across all deferred-compute
-        // consumers in the same frame), we can grab its DXGI surface
-        // directly and skip the per-dispatch DrawImage round-trip.
-        // This is the dominant cost on multi-consumer graphs (4 stats +
-        // 1 tonemap = 5 dispatches all consuming the same Source ->
-        // 5 redundant DrawImage calls + 5 FP32 bitmap allocations
-        // before this fast path).
-        bool inputIsAlreadyFp32Bitmap = false;
+        // Hold a reference per slot so the textures don't get released
+        // while we're building SRVs / driving the dispatch below.
+        std::vector<winrt::com_ptr<ID3D11Texture2D>> inputTextures;
+        inputTextures.reserve(inputCount);
+        UINT32 firstW = 0, firstH = 0;
+
+        for (UINT32 idx = 0; idx < inputCount; ++idx)
         {
-            winrt::com_ptr<ID2D1Bitmap1> asBitmap;
-            if (SUCCEEDED(inputImage->QueryInterface(asBitmap.put())) && asBitmap)
+            ID2D1Image* inputImage = inputImages[idx];
+            if (!inputImage)
             {
-                auto px = asBitmap->GetPixelFormat();
-                auto sz = asBitmap->GetPixelSize();
-                if (px.format == DXGI_FORMAT_R32G32B32A32_FLOAT &&
-                    sz.width == w && sz.height == h)
+                dc->SetDpi(oldDpiX, oldDpiY);
+                return E_INVALIDARG;
+            }
+
+            D2D1_RECT_F bounds{};
+            dc->GetImageLocalBounds(inputImage, &bounds);
+            UINT32 w = static_cast<UINT32>((std::min)(bounds.right - bounds.left, 8192.0f));
+            UINT32 h = static_cast<UINT32>((std::min)(bounds.bottom - bounds.top, 8192.0f));
+            if (w == 0 || h == 0)
+            {
+                dc->SetDpi(oldDpiX, oldDpiY);
+                return E_NOT_VALID_STATE;
+            }
+            if (idx == 0) { firstW = w; firstH = h; }
+
+            winrt::com_ptr<ID2D1Bitmap1> inputBmp;
+            // Fast path: input is already an FP32-RGBA D2D bitmap of the
+            // expected size (e.g. produced by GraphEvaluator's
+            // PreRenderInputBitmap and shared across multiple deferred-
+            // compute consumers). Skip the per-dispatch DrawImage
+            // round-trip and grab the DXGI surface directly.
+            bool inputIsAlreadyFp32Bitmap = false;
+            {
+                winrt::com_ptr<ID2D1Bitmap1> asBitmap;
+                if (SUCCEEDED(inputImage->QueryInterface(asBitmap.put())) && asBitmap)
                 {
-                    inputBmp = asBitmap;
-                    inputIsAlreadyFp32Bitmap = true;
+                    auto px = asBitmap->GetPixelFormat();
+                    auto sz = asBitmap->GetPixelSize();
+                    if (px.format == DXGI_FORMAT_R32G32B32A32_FLOAT &&
+                        sz.width == w && sz.height == h)
+                    {
+                        inputBmp = asBitmap;
+                        inputIsAlreadyFp32Bitmap = true;
+                    }
                 }
             }
+
+            if (!inputIsAlreadyFp32Bitmap)
+            {
+                auto& cache = m_inputBitmaps[idx];
+                if (cache.bitmap && cache.width == w && cache.height == h)
+                {
+                    inputBmp = cache.bitmap;
+                }
+                else
+                {
+                    D2D1_BITMAP_PROPERTIES1 bp{};
+                    bp.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
+                    bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
+                    bp.dpiX = 96.0f;
+                    bp.dpiY = 96.0f;
+                    HRESULT hrAlloc = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bp, inputBmp.put());
+                    if (FAILED(hrAlloc)) { dc->SetDpi(oldDpiX, oldDpiY); return hrAlloc; }
+                    cache.bitmap = inputBmp;
+                    cache.width  = w;
+                    cache.height = h;
+                }
+
+                // Render upstream chain into our cached bitmap. Necessary
+                // when inputImage is a D2D effect output (not already an
+                // FP32 bitmap) -- the format-convert happens via DrawImage.
+                winrt::com_ptr<ID2D1Image> prevTarget;
+                dc->GetTarget(prevTarget.put());
+                dc->SetTarget(inputBmp.get());
+                dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+                dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
+                dc->SetTarget(prevTarget.get());
+                dc->Flush();  // D2D batches DrawImage until Flush/EndDraw.
+            }
+
+            winrt::com_ptr<IDXGISurface> surface;
+            HRESULT hr = inputBmp->GetSurface(surface.put());
+            if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return hr; }
+            winrt::com_ptr<ID3D11Texture2D> tex;
+            hr = surface->QueryInterface(tex.put());
+            if (FAILED(hr)) { dc->SetDpi(oldDpiX, oldDpiY); return hr; }
+            inputTextures.push_back(std::move(tex));
         }
 
-        if (!inputIsAlreadyFp32Bitmap)
-        {
-            if (m_inputBitmap && m_inputBitmapW == w && m_inputBitmapH == h)
-            {
-                inputBmp = m_inputBitmap;
-            }
-            else
-            {
-                D2D1_BITMAP_PROPERTIES1 bp{};
-                bp.pixelFormat = { DXGI_FORMAT_R32G32B32A32_FLOAT, D2D1_ALPHA_MODE_PREMULTIPLIED };
-                bp.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;
-                bp.dpiX = 96.0f;
-                bp.dpiY = 96.0f;
-                HRESULT hrAlloc = dc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, bp, inputBmp.put());
-                if (FAILED(hrAlloc)) { dc->SetDpi(oldDpiX, oldDpiY); return hrAlloc; }
-                m_inputBitmap  = inputBmp;
-                m_inputBitmapW = w;
-                m_inputBitmapH = h;
-            }
-
-            // Render upstream chain into our cached bitmap. Necessary
-            // when inputImage is a D2D effect output (not already an
-            // FP32 bitmap) -- the format-convert happens via DrawImage.
-            winrt::com_ptr<ID2D1Image> prevTarget;
-            dc->GetTarget(prevTarget.put());
-            dc->SetTarget(inputBmp.get());
-            dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-            dc->DrawImage(inputImage, D2D1::Point2F(-bounds.left, -bounds.top));
-            dc->SetTarget(prevTarget.get());
-            dc->Flush();  // D2D batches DrawImage until Flush/EndDraw.
-        }
         dc->SetDpi(oldDpiX, oldDpiY);
 
-        winrt::com_ptr<IDXGISurface> surface;
-        HRESULT hr = inputBmp->GetSurface(surface.put());
-        if (FAILED(hr)) return hr;
-        winrt::com_ptr<ID3D11Texture2D> inputTex;
-        hr = surface->QueryInterface(inputTex.put());
-        if (FAILED(hr)) return hr;
-
-        // Lazily initialize the runner with the same D3D11 device the
-        // input texture is on (matches D2D's underlying device).
+        // Lazily initialize the runner with the same D3D11 device as the
+        // input texture (matches D2D's underlying device).
         winrt::com_ptr<ID3D11Device> device;
-        inputTex->GetDevice(device.put());
+        inputTextures[0]->GetDevice(device.put());
         if (!m_runner.IsInitialized())
             m_runner.Initialize(device.get());
 
         if (m_bytecodeDirty)
         {
-            // The runner's CompileShader takes HLSL source -- but for
-            // the bridge we have pre-compiled bytecode. The runner
-            // accepts a compile that re-emits the same bytecode by
-            // including a marker; for a fully clean cut we'd add a
-            // SetCompiledBytecode method to the runner. For now,
-            // call the runner's existing path: the Dispatch() method
-            // requires the runner's m_shader to be populated, which
-            // happens via CompileShader. We bypass by going direct
-            // through CreateComputeShader on the device.
             winrt::com_ptr<ID3D11ComputeShader> tempShader;
-            hr = device->CreateComputeShader(
+            HRESULT hr = device->CreateComputeShader(
                 m_pendingBytecode.data(),
                 m_pendingBytecode.size(),
                 nullptr, tempShader.put());
             if (FAILED(hr)) return hr;
-            // Stash bytecode + shader on the runner via its public
-            // interface. Today the runner exposes CompileShader(string)
-            // which compiles at runtime; we want to install pre-compiled
-            // bytecode. The runner's path through Dispatch will work as
-            // long as m_shader is set -- we extend the runner with
-            // SetPrecompiledShader in a follow-up. For now, fall back
-            // to D3DCompile path: not ideal but functional.
-            //
-            // Actually -- we only need a single cs_5_0 shader install,
-            // and the runner's Dispatch internally uses m_shader.get().
-            // The CreateComputeShader on `device` produced a valid
-            // shader; we can pass it to the runner via a small helper
-            // we add below.
             m_runner.InstallPrecompiledShader(
                 m_pendingBytecode, tempShader);
             m_bytecodeDirty = false;
@@ -385,13 +383,11 @@ float4 main(
         // re-created on size change.
         if (imageOutputW > 0 && imageOutputH > 0)
         {
-            hr = EnsureImageOutputTexture(device.get(), dc, imageOutputW, imageOutputH);
+            HRESULT hr = EnsureImageOutputTexture(device.get(), dc, imageOutputW, imageOutputH);
             if (FAILED(hr)) return hr;
         }
         else if (m_imageOutputTex)
         {
-            // Tear down the image-output side if a prior instance had
-            // one and this dispatch doesn't.
             m_imageOutput = nullptr;
             m_imageOutputTex = nullptr;
             m_imageOutputW = 0;
@@ -405,21 +401,18 @@ float4 main(
         if (cbufferData && cbufferSize > 0)
             cbBytes.assign(cbufferData, cbufferData + cbufferSize);
 
-        // Drive the dispatch through the runner's existing entry. This
-        // populates the runner's structured-buffer SRV (analysis output)
-        // and reads it back to floats. The image-output side runs in
-        // parallel via a u1 binding the bridge sets up below. Phase 8
-        // GPU bindings (m_gpuBindingSrvs / m_gpuBindingSlots) flow
-        // through as extra SRVs at consumer-declared t-slots.
-        //
-        // Phase 8c: when caller passes outAnalysisFloats=nullptr it
-        // signals "no CPU consumer this frame" -- skip the runner's
-        // CopyResource + Map. The structured-buffer UAV is still sized
-        // and populated by the dispatch; only the readback round-trip
-        // is elided. Downstream GPU SRV consumers see the same buffer.
+        // Drive the dispatch through the runner. Phase 8c: when caller
+        // passes outAnalysisFloats=nullptr it signals "no CPU consumer
+        // this frame" -- skip the runner's CopyResource + Map.
         const bool readbackToCpu = (outAnalysisFloats != nullptr);
+
+        // Build a raw-pointer array of input textures for the runner.
+        std::vector<ID3D11Texture2D*> inputRaw;
+        inputRaw.reserve(inputTextures.size());
+        for (const auto& t : inputTextures) inputRaw.push_back(t.get());
+
         auto floats = m_runner.DispatchWithImageOutput(
-            inputTex.get(),
+            inputRaw,
             cbBytes,
             analysisFloat4Count,
             m_imageOutputTex.get(),

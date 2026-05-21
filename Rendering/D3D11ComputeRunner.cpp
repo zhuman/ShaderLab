@@ -156,11 +156,12 @@ namespace ShaderLab::Rendering
         const std::vector<BYTE>& cbufferData,
         uint32_t resultCount)
     {
-        return DispatchWithImageOutput(inputTexture, cbufferData, resultCount, nullptr);
+        std::vector<ID3D11Texture2D*> inputs{ inputTexture };
+        return DispatchWithImageOutput(inputs, cbufferData, resultCount, nullptr);
     }
 
     std::vector<float> D3D11ComputeRunner::DispatchWithImageOutput(
-        ID3D11Texture2D* inputTexture,
+        const std::vector<ID3D11Texture2D*>& inputTextures,
         const std::vector<BYTE>& cbufferData,
         uint32_t resultCount,
         ID3D11Texture2D* imageOutputTexture,
@@ -170,12 +171,14 @@ namespace ShaderLab::Rendering
         bool readbackToCpu)
     {
         std::vector<float> result;
-        if (!m_shader || !m_context || !inputTexture)
+        if (!m_shader || !m_context || inputTextures.empty() || !inputTextures[0])
             return result;
 
-        // Get texture dimensions.
+        // Auto-inject Width / Height come from input #0 (t0). Multi-input
+        // shaders are expected to operate on inputs of the same size --
+        // upstream is responsible for matching dimensions before binding.
         D3D11_TEXTURE2D_DESC texDesc{};
-        inputTexture->GetDesc(&texDesc);
+        inputTextures[0]->GetDesc(&texDesc);
 
         // Ensure buffers are the right size. Use 1 as the floor so
         // analysis-only shaders that emit no analysis output (rare,
@@ -185,14 +188,26 @@ namespace ShaderLab::Rendering
         EnsureBuffers(bufferSlots);
         if (!m_resultBuffer || !m_resultUAV || !m_cbuffer) return result;
 
-        // Create SRV for input.
-        winrt::com_ptr<ID3D11ShaderResourceView> srv;
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
-        srvDesc.Format = texDesc.Format;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = 1;
-        HRESULT hr = m_device->CreateShaderResourceView(inputTexture, &srvDesc, srv.put());
-        if (FAILED(hr)) return result;
+        // Create one SRV per input texture, bound at t0..t(N-1) in order.
+        std::vector<winrt::com_ptr<ID3D11ShaderResourceView>> inputSrvs;
+        inputSrvs.reserve(inputTextures.size());
+        std::vector<ID3D11ShaderResourceView*> inputSrvPtrs;
+        inputSrvPtrs.reserve(inputTextures.size());
+        for (auto* tex : inputTextures)
+        {
+            if (!tex) return result;
+            D3D11_TEXTURE2D_DESC d{};
+            tex->GetDesc(&d);
+            winrt::com_ptr<ID3D11ShaderResourceView> srv;
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+            srvDesc.Format = d.Format;
+            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = 1;
+            HRESULT hr = m_device->CreateShaderResourceView(tex, &srvDesc, srv.put());
+            if (FAILED(hr)) return result;
+            inputSrvPtrs.push_back(srv.get());
+            inputSrvs.push_back(std::move(srv));
+        }
 
         // Image-output UAV (optional).
         winrt::com_ptr<ID3D11UnorderedAccessView> imageUAV;
@@ -203,7 +218,7 @@ namespace ShaderLab::Rendering
             D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
             uavDesc.Format = outDesc.Format;
             uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-            hr = m_device->CreateUnorderedAccessView(imageOutputTexture, &uavDesc, imageUAV.put());
+            HRESULT hr = m_device->CreateUnorderedAccessView(imageOutputTexture, &uavDesc, imageUAV.put());
             if (FAILED(hr)) return result;
             // Clear the image-output UAV so previous-frame contents
             // don't leak through when the shader writes selectively.
@@ -213,12 +228,12 @@ namespace ShaderLab::Rendering
 
         // Pack cbuffer: Width, Height (8 bytes) + user data.
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        hr = m_context->Map(m_cbuffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        HRESULT hr = m_context->Map(m_cbuffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
         if (SUCCEEDED(hr))
         {
             memset(mapped.pData, 0, 256);
             auto* cb = static_cast<BYTE*>(mapped.pData);
-            // Auto-inject Width, Height.
+            // Auto-inject Width, Height (from input #0).
             uint32_t dims[2] = { texDesc.Width, texDesc.Height };
             memcpy(cb, dims, 8);
             // Copy user params starting at offset 8.
@@ -236,8 +251,7 @@ namespace ShaderLab::Rendering
 
         // Dispatch.
         m_context->CSSetShader(m_shader.get(), nullptr, 0);
-        ID3D11ShaderResourceView* srvs[] = { srv.get() };
-        m_context->CSSetShaderResources(0, 1, srvs);
+        m_context->CSSetShaderResources(0, static_cast<UINT>(inputSrvPtrs.size()), inputSrvPtrs.data());
 
         // Phase 8: GPU-bound parameters arrive as extra SRVs. Each
         // (slot, srv) pair binds the upstream IEngineComputeOutput's
@@ -263,8 +277,8 @@ namespace ShaderLab::Rendering
             (std::max)(dispatchZ, 1u));
 
         // Clear shader state.
-        ID3D11ShaderResourceView* nullSRV[] = { nullptr };
-        m_context->CSSetShaderResources(0, 1, nullSRV);
+        std::vector<ID3D11ShaderResourceView*> nullSrvs(inputSrvPtrs.size(), nullptr);
+        m_context->CSSetShaderResources(0, static_cast<UINT>(nullSrvs.size()), nullSrvs.data());
         for (size_t i = 0; i < maxExtra; ++i)
         {
             ID3D11ShaderResourceView* none[1] = { nullptr };

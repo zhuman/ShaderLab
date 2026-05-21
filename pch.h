@@ -44,11 +44,6 @@
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Text.h>
 
-// Win2D
-#include <winrt/Microsoft.Graphics.Canvas.h>
-#include <winrt/Microsoft.Graphics.Canvas.Effects.h>
-#include <winrt/Microsoft.Graphics.Canvas.UI.Xaml.h>
-
 // Direct3D / Direct2D / DXGI
 #include <d3d11_4.h>
 #include <d2d1_3.h>
@@ -74,7 +69,6 @@
 
 // Interop helpers
 #include <microsoft.ui.xaml.window.h>
-#include <Microsoft.Graphics.Canvas.native.h>
 #include <Shobjidl.h>
 
 // STL

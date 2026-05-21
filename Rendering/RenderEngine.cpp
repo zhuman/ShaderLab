@@ -29,6 +29,14 @@ namespace ShaderLab::Rendering
     void RenderEngine::Shutdown()
     {
         ReleaseRenderTarget();
+        // P7: release the offscreen pair too. These hold raw D3D textures +
+        // D2D bitmap wrappers for the render-thread offscreen-blit path. If
+        // we don't drop them here, a SwitchAdapter teardown leaves stale
+        // references to the OLD device, EnsureOffscreenTargets sees the
+        // bitmaps still populated at the right size and skips recreate, and
+        // every subsequent EndDraw fails (~40% of frames) because the
+        // bitmaps target a destroyed device.
+        ReleaseOffscreenTargets();
 
         // Clear the swap chain reference from the XAML panel BEFORE
         // releasing it, otherwise the compositor crashes accessing
@@ -45,6 +53,7 @@ namespace ShaderLab::Rendering
 
         m_swapChain = nullptr;
         m_d2dDeviceContext = nullptr;
+        m_renderD2dContext = nullptr; // P7: dedicated render-thread context.
         m_d2dDevice = nullptr;
         m_d2dFactory = nullptr;
         m_d3dContext = nullptr;
@@ -149,18 +158,16 @@ namespace ShaderLab::Rendering
 
         // --- D2D Factory ---
         D2D1_FACTORY_OPTIONS d2dOptions{};
-#ifdef _DEBUG
-        // TEMP (p8c-d2d-debug-layer): D2D debug layer raises a
-        // breakpoint somewhere inside the bridge + binding +
-        // downstream chain combo. Real D2D contract violation that
-        // we haven't pinpointed yet -- masked here so the app stays
-        // alive while the GPU-binding fast path runs. Revert to
-        // INFORMATION once the bug is identified and fixed.
         d2dOptions.debugLevel = D2D1_DEBUG_LEVEL_NONE;
-#endif
         winrt::check_hresult(
             D2D1CreateFactory(
-                D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                // Multi-threaded factory: the engine D2D context is owned by
+                // the render-worker thread but the live capture providers
+                // (DXGI Desktop Duplication, Windows Graphics Capture) deliver
+                // frames on background threads, and adapter switch / device
+                // teardown runs on the UI thread. ID2D1Multithread serializes
+                // factory + device + context calls automatically.
+                D2D1_FACTORY_TYPE_MULTI_THREADED,
                 __uuidof(ID2D1Factory7),
                 &d2dOptions,
                 m_d2dFactory.put_void()));
@@ -181,6 +188,18 @@ namespace ShaderLab::Rendering
                 D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
                 baseDC.put()));
         m_d2dDeviceContext = baseDC.as<ID2D1DeviceContext5>();
+
+        // P7: dedicated render-thread D2D context, sharing the same
+        // multi-threaded D2D device. State (target/transform/dpi) is
+        // independent so the render worker's BeginDraw/EndDraw can't be
+        // corrupted by concurrent UI-thread draws on m_d2dDeviceContext
+        // (capture path, pixel inspector, etc.).
+        winrt::com_ptr<ID2D1DeviceContext> baseRenderDC;
+        winrt::check_hresult(
+            m_d2dDevice->CreateDeviceContext(
+                D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+                baseRenderDC.put()));
+        m_renderD2dContext = baseRenderDC.as<ID2D1DeviceContext5>();
     }
 
     // -----------------------------------------------------------------------
@@ -372,6 +391,89 @@ namespace ShaderLab::Rendering
         DXGI_PRESENT_PARAMETERS params{};
         winrt::check_hresult(
             m_swapChain->Present1(vsync ? 1 : 0, 0, &params));
+    }
+
+    // -----------------------------------------------------------------------
+    // Offscreen target pair (Phase 7 -- render-thread split)
+    // -----------------------------------------------------------------------
+
+    bool RenderEngine::EnsureOffscreenTargets(uint32_t width, uint32_t height)
+    {
+        if (!m_d3dDevice || !m_renderD2dContext)
+            return false;
+
+        if (width == 0 || height == 0)
+            return false;
+
+        // Already at the right size?
+        if (m_offscreenWidth == width && m_offscreenHeight == height &&
+            m_offscreenTexture[0] && m_offscreenTexture[1] &&
+            m_offscreenRenderBitmap[0] && m_offscreenRenderBitmap[1])
+        {
+            return true;
+        }
+
+        ReleaseOffscreenTargets();
+
+        // Pipeline format matches the swap chain so there's no color-space
+        // conversion at the blit. scRGB FP16 by default.
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = width;
+        td.Height = height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = m_format.dxgiFormat; // matches swap chain
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            HRESULT hr = m_d3dDevice->CreateTexture2D(&td, nullptr,
+                m_offscreenTexture[i].put());
+            if (FAILED(hr))
+            {
+                ReleaseOffscreenTargets();
+                return false;
+            }
+
+            // Wrap as D2D bitmap on the render-thread D2D context. This is
+            // the bitmap the render thread sets as its draw target.
+            winrt::com_ptr<IDXGISurface> surface;
+            hr = m_offscreenTexture[i]->QueryInterface(IID_PPV_ARGS(surface.put()));
+            if (FAILED(hr))
+            {
+                ReleaseOffscreenTargets();
+                return false;
+            }
+
+            D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(m_format.dxgiFormat, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f);
+            hr = m_renderD2dContext->CreateBitmapFromDxgiSurface(
+                surface.get(), bp, m_offscreenRenderBitmap[i].put());
+            if (FAILED(hr))
+            {
+                ReleaseOffscreenTargets();
+                return false;
+            }
+        }
+
+        m_offscreenWidth = width;
+        m_offscreenHeight = height;
+        return true;
+    }
+
+    void RenderEngine::ReleaseOffscreenTargets()
+    {
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            m_offscreenRenderBitmap[i] = nullptr;
+            m_offscreenTexture[i] = nullptr;
+        }
+        m_offscreenWidth = 0;
+        m_offscreenHeight = 0;
     }
 
     // -----------------------------------------------------------------------

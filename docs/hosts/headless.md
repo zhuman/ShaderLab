@@ -49,7 +49,7 @@ ShaderLabHeadless --graph PATH --node ID --output PNG_PATH [options]
 
 ## Engine-side reuse
 
-The MCP route registry (`RegisterEngineRoutes`) is what backs both the GUI host's HTTP server **and** the headless `--script` mode. The same closures execute against the same engine state — only the sink's `Dispatch` impl differs between hosts (`MainWindow::DispatchSync` for the GUI, synchronous direct-call for headless). The headless host overrides none of the eight `IEngineCommandSink` event hooks; without a UI to keep in sync, every hook is a no-op.
+The MCP route registry (`RegisterEngineRoutes`) is what backs both the GUI host's HTTP server **and** the headless `--script` mode. The same closures execute against the same engine state — only the sink's `Dispatch` impl differs between hosts. The GUI sink marshals to the render worker thread via `RenderThreadDispatcher::DispatchSync` (post-P7); the headless sink runs the closure inline since the script runner thread is the only consumer. The headless host overrides none of the eight `IEngineCommandSink` event hooks; without a UI to keep in sync, every hook is a no-op.
 
 ## Smoke coverage
 

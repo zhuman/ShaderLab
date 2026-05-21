@@ -86,7 +86,8 @@ namespace ShaderLab::Effects
         // output (when requested) via `GetImageOutput`.
         virtual HRESULT STDMETHODCALLTYPE Dispatch(
             ID2D1DeviceContext5* dc,
-            ID2D1Image* inputImage,
+            ID2D1Image* const* inputImages,
+            UINT32 inputCount,
             const BYTE* cbufferData,
             UINT32 cbufferSize,
             UINT32 analysisFloat4Count,
@@ -198,7 +199,8 @@ namespace ShaderLab::Effects
             const BYTE* bytecode, UINT32 bytecodeSize) override;
         HRESULT STDMETHODCALLTYPE Dispatch(
             ID2D1DeviceContext5* dc,
-            ID2D1Image* inputImage,
+            ID2D1Image* const* inputImages,
+            UINT32 inputCount,
             const BYTE* cbufferData,
             UINT32 cbufferSize,
             UINT32 analysisFloat4Count,
@@ -257,9 +259,16 @@ namespace ShaderLab::Effects
         // fresh FP32 bitmap (132 MB at 4K!) on every dispatch, which
         // dominated frame time (~30ms/frame on Intel Arc). Re-created
         // only when the upstream's dimensions change.
-        winrt::com_ptr<ID2D1Bitmap1>    m_inputBitmap;
-        UINT32                          m_inputBitmapW{ 0 };
-        UINT32                          m_inputBitmapH{ 0 };
+        // Cached FP32 input bitmaps -- one per input slot (t0..tN-1).
+        // Reused across frames when the input dimensions don't change,
+        // dropped + reallocated when they do. Vector grows lazily as
+        // shaders with more inputs come through.
+        struct CachedInputBitmap {
+            winrt::com_ptr<ID2D1Bitmap1> bitmap;
+            UINT32 width{ 0 };
+            UINT32 height{ 0 };
+        };
+        std::vector<CachedInputBitmap> m_inputBitmaps;
 
         UINT64 m_lastEvaluatedFrame{ 0 };
 

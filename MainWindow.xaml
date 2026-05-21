@@ -321,19 +321,30 @@
                            Style="{StaticResource CaptionTextBlockStyle}" />
             </StackPanel>
 
-            <TextBlock x:Name="FpsText" Grid.Column="6"
-                       Text="FPS: --"
-                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
-                       Style="{StaticResource CaptionTextBlockStyle}">
-                <ToolTipService.ToolTip>
-                    <ToolTip x:Name="FpsTooltip">
+            <Button x:Name="FpsButton" Grid.Column="6"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    Padding="4,0,4,0"
+                    MinWidth="0" MinHeight="0"
+                    Foreground="{ThemeResource TextFillColorSecondaryBrush}">
+                <TextBlock x:Name="FpsText"
+                           Text="FPS: --"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           Style="{StaticResource CaptionTextBlockStyle}" />
+                <Button.Flyout>
+                    <Flyout x:Name="FpsFlyout" ShowMode="Standard">
                         <TextBlock x:Name="FpsTooltipText"
                                    FontFamily="Cascadia Mono, Consolas, Courier New"
                                    FontSize="11"
                                    Text="(no data yet)" />
+                    </Flyout>
+                </Button.Flyout>
+                <ToolTipService.ToolTip>
+                    <ToolTip>
+                        <TextBlock Text="Click for per-phase frame timing breakdown" />
                     </ToolTip>
                 </ToolTipService.ToolTip>
-            </TextBlock>
+            </Button>
             <TextBlock x:Name="AppVersionText" Grid.Column="7"
                        Visibility="Collapsed" />
         </Grid>

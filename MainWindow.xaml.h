@@ -5,6 +5,7 @@
 #include "Rendering/DisplayMonitor.h"
 #include "Rendering/GraphEvaluator.h"
 #include "Graph/EffectGraph.h"
+#include "Graph/GraphUiSnapshot.h"
 #include "Effects/EffectRegistry.h"
 #include "Effects/SourceNodeFactory.h"
 #include "Effects/CustomPixelShaderEffect.h"
@@ -19,6 +20,7 @@
 #include "EffectDesignerWindow.xaml.h"
 #include "Engine/Mcp/McpHttpServer.h"
 #include "Engine/Mcp/EngineMcpRoutes.h"
+#include "Rendering/RenderThreadDispatcher.h"
 
 namespace winrt::ShaderLab::implementation
 {
@@ -206,16 +208,114 @@ namespace winrt::ShaderLab::implementation
             winrt::Windows::Foundation::IInspectable const& sender,
             winrt::Microsoft::UI::Xaml::Input::PointerRoutedEventArgs const& args);
 
-        // Render loop.
+        // Render loop. UI-only work runs on the m_renderTimer DispatcherQueueTimer
+        // (XAML reads/writes, FPS panel updates, RenderNodeGraph against the UI
+        // D2D context). RenderTickBody runs on the dedicated render-worker
+        // thread (or, in synchronous mode, inline from OnRenderTick).
         void OnRenderTick(
             winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer const& sender,
             winrt::Windows::Foundation::IInspectable const& args);
+        void RenderTickBody(double deltaSec);
         void RenderFrame(double deltaSeconds = 0.0);
+
+        // Render-thread frame body. Walks the graph, runs eval + deferred
+        // compute, draws the preview image into one of the offscreen
+        // targets, and publishes via m_offscreenPublishedIdx. NO swap-chain
+        // Present (UI thread does that in BlitOffscreenToSwapChain).
+        void RenderFrameToOffscreen(double deltaSec);
+
+        // UI-thread blit step. Reads m_offscreenPublishedIdx, copies the
+        // corresponding bitmap into the SwapChainPanel-bound swap chain,
+        // calls Present1. Idempotent when no new frame has been published.
+        void BlitOffscreenToSwapChain();
+
+        // Recreates the UI-side D2D wrapper bitmaps when the render engine's
+        // offscreen size changes. Must run on UI thread (m_uiD2dContext is
+        // UI-owned).
+        bool EnsureOffscreenUiWrappers();
+
+        // Render-worker thread loop. Owns the render-engine D2D context. Drives
+        // its own cadence (16ms wakeup) and drains m_renderDispatcher commands
+        // each iteration. Spawned by InitializeRendering, joined in Shutdown.
+        void RenderWorkerLoop(std::stop_token stop);
 
         // Device stack.
         ::ShaderLab::Rendering::RenderEngine       m_renderEngine;
         ::ShaderLab::Rendering::DisplayMonitor     m_displayMonitor;
         ::ShaderLab::Rendering::GraphEvaluator     m_graphEvaluator;
+
+        // Render-thread plumbing. The dispatcher carries closures from UI /
+        // MCP / NodeGraphController producers to whichever thread owns
+        // rendering. Until the actual worker thread spawns (Phase 7), the
+        // dispatcher runs in synchronous mode -- closures execute inline on
+        // the calling thread, preserving today's single-thread behavior.
+        ::ShaderLab::Rendering::RenderThreadDispatcher m_renderDispatcher{ /*synchronous=*/false };
+
+        // Render-worker thread. Spawned in InitializeRendering once the
+        // device is up; joined in Shutdown after m_isShuttingDown is set
+        // and the dispatcher is signalled. Runs RenderWorkerLoop.
+        std::jthread m_renderWorker;
+
+        // Latest published immutable snapshot of the graph + per-node runtime
+        // state. The render path republishes after each frame; UI reads pull
+        // via std::atomic_load(&m_uiGraphSnapshot). Initially nullptr until
+        // the first render tick publishes.
+        std::atomic<std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>>
+            m_uiGraphSnapshot{ nullptr };
+
+        // Offscreen-render publish protocol (Phase 7). Render thread renders
+        // into m_renderEngine.OffscreenRenderBitmap(writeIdx); when done, it
+        // stores writeIdx into m_offscreenPublishedIdx (release). UI thread
+        // loads m_offscreenPublishedIdx (acquire) and blits the corresponding
+        // bitmap. Index -1 means no frame published yet.
+        //
+        // m_offscreenSourceBitmapUi[idx] are UI-side D2D bitmap wrappers of
+        // the same D3D11 textures as the render-side bitmaps -- created on
+        // m_uiD2dContext, used as DrawImage source. They get rebuilt in lock-
+        // step with EnsureOffscreenTargets when the offscreen size changes.
+        winrt::com_ptr<ID2D1Bitmap1>            m_offscreenSourceBitmapUi[2];
+        std::atomic<int32_t>                    m_offscreenPublishedIdx{ -1 };
+        std::atomic<uint64_t>                   m_offscreenPublishedVersion{ 0 };
+        // Tracks the size we last allocated UI-side wrappers for. When this
+        // doesn't match RenderEngine's offscreen size, UI thread rebuilds.
+        uint32_t                                m_offscreenWrapperWidth{ 0 };
+        uint32_t                                m_offscreenWrapperHeight{ 0 };
+
+        // Generation counters. graphGeneration bumps every time the render
+        // path observes a graph mutation (HasDirtyNodes etc.); frameGeneration
+        // bumps once per render tick. Both are written only from the render
+        // path so a non-atomic uint64 is fine.
+        uint64_t m_graphGeneration{ 0 };
+        uint64_t m_frameGeneration{ 0 };
+
+        // UI-thread cached value of the last snapshot frameGeneration we
+        // observed in OnRenderTick. When the worker thread bumps
+        // m_frameGeneration (in RenderWorkerLoop, every iteration), this
+        // stays behind until the UI tick catches up. We use the difference
+        // to decide whether to redraw the editor canvas -- without it the
+        // canvas only redraws on UI-side interaction, so live values like
+        // clock progress, video position, and analysis-output fields
+        // appear frozen even though the snapshot has fresh data.
+        uint64_t m_lastSeenFrameGeneration{ 0 };
+
+        // UI-thread cached value of the last offscreen-publish version we
+        // blitted. The render worker bumps m_offscreenPublishedVersion
+        // every successful EndDraw. If it hasn't changed since our last
+        // tick, we skip the blit + Present1 -- otherwise the UI thread
+        // vsync-waits at 60 Hz even when the worker is only producing
+        // frames at 10 Hz, starving input event delivery during heavy
+        // graph eval (causing dropdown / hover input lag).
+        uint64_t m_lastBlittedVersion{ 0 };
+
+        // UI-side D2D stack -- separate D2D factory + device + immediate
+        // context for drawing the node-graph editor canvas and pixel-trace
+        // swatch panel. Shares the D3D11 device with the render engine but
+        // never touches its D2D resources. Once the render thread (Phase 7)
+        // owns the engine D2D context exclusively, the editor canvas keeps
+        // working on the UI thread without crossing the multithread fence.
+        winrt::com_ptr<ID2D1Factory7>          m_uiD2dFactory;
+        winrt::com_ptr<ID2D1Device6>           m_uiD2dDevice;
+        winrt::com_ptr<ID2D1DeviceContext5>    m_uiD2dContext;
 
         // Effect graph.
         ::ShaderLab::Graph::EffectGraph         m_graph;
@@ -229,9 +329,24 @@ namespace winrt::ShaderLab::implementation
 
         // Output windows (one per additional Output node).
         std::vector<std::unique_ptr<::ShaderLab::Controls::OutputWindow>> m_outputWindows;
+        // P7: parallel list of cross-thread sinks (one per OutputWindow). The
+        // render worker iterates this snapshot WITHOUT touching the UI-owned
+        // OutputWindow itself. Each entry's shared_ptr keeps the cross-thread
+        // state alive even if the UI closes the window mid-render. The list
+        // mutex protects vector mutations (open/close); the per-sink mutex
+        // inside OutputSinkRenderState protects view-state updates.
+        std::vector<std::shared_ptr<::ShaderLab::Controls::OutputSinkRenderState>> m_outputSinks;
+        std::mutex m_outputSinksMutex;
         void OpenOutputWindow(uint32_t nodeId);
         void CloseOutputWindow(uint32_t nodeId);
         void PresentOutputWindows();
+        // P7 render-thread entry point: iterate a snapshot of m_outputSinks
+        // and render each non-closed sink's offscreen pair from its node's
+        // current cachedOutput. Called from RenderFrameToOffscreen after
+        // the main preview offscreen draw completes (BeginDraw scope still
+        // open is fine; we do our own SetTarget+BeginDraw on each sink's
+        // render-side bitmap).
+        void RenderOutputSinks();
 
         // Per-node log system.
         std::unordered_map<uint32_t, ::ShaderLab::Controls::NodeLog> m_nodeLogs;
@@ -242,7 +357,7 @@ namespace winrt::ShaderLab::implementation
 
         // Render loop timer.
         winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer m_renderTimer{ nullptr };
-        uint32_t m_frameCount{ 0 };
+        std::atomic<uint64_t> m_frameCount{ 0 };
         uint64_t m_lastVideoUploadCount{ 0 };
         float    m_lastFps{ 0.0f };
         float    m_lastVideoFps{ 0.0f };
@@ -261,17 +376,29 @@ namespace winrt::ShaderLab::implementation
         // Per-frame performance timings (microseconds, rolling averages).
         struct FrameTimings {
             double totalUs{};            // wall-clock between consecutive timer ticks (true frame interval)
-            double videoTickUs{};        // TickAndUploadLiveCaptures + TickAndUploadVideos + dirty propagation
-            double sourcesPrepUs{};      // PrepareSourceNode loop inside RenderFrame
+            // Graph evaluation phases (render thread, RenderFrameToOffscreen).
+            // These add up to totalUs and represent the actual cost of one
+            // graph eval -- which is the meaningful number for HDR shader /
+            // tonemap perf evaluation, the primary focus of this app.
+            double sourcesPrepUs{};      // PrepareSourceNode loop (image/video upload)
             double evaluateUs{};         // GraphEvaluator::Evaluate (passes 1 + 2)
             double deferredComputeUs{};  // ProcessDeferredCompute (D3D11 compute dispatches) + post-PDC eval
-            double drawUs{};             // swap-chain DrawImage (CPU command queueing)
-            double presentUs{};          // RenderEngine::Present (back-buffer swap, blocks on VSync/GPU)
-            double nodeGraphUs{};        // RenderNodeGraph + overlays (canvas redraw)
-            double outputWindowsUs{};    // PresentOutputWindows (peeled-off output panes)
-            double traceUs{};            // PopulatePixelTraceTree + RenderTraceSwatches
+            double drawUs{};             // DrawImage(preview) into the offscreen target
+            double endDrawFlushUs{};     // dc->EndDraw() flush; renamed from presentUs --
+                                          // actual SwapChain Present1 happens UI-side and
+                                          // is reported under uiTickUs.
+
+            // UI thread overhead (OnRenderTick total). Mostly Present1 vsync
+            // wait and Direct3D pipeline drain. NOT counted in totalUs.
+            double uiTickUs{};           // OnRenderTick wall time: drain + blit + Present1 + canvas redraw
+
+            // Misc per-frame work, both on the render side.
+            double videoTickUs{};        // (currently unused on P7 path; kept for compat)
+            double outputWindowsUs{};    // PresentOutputWindows (peeled-off output panes; P7-pending)
+            double traceUs{};            // PopulatePixelTraceTree + RenderTraceSwatches (UI thread)
             uint32_t computeDispatches{};
             uint32_t framesSampled{};
+            uint32_t endDrawFailed{};    // diagnostic: count of EndDraw failures (D2DERR_RECREATE_TARGET, etc.)
         };
         FrameTimings m_frameTiming;
         FrameTimings m_lastFrameTiming;  // snapshot for MCP read
@@ -279,6 +406,7 @@ namespace winrt::ShaderLab::implementation
         HWND m_hwnd{ nullptr };
         bool m_customEffectsRegistered{ false };
         bool m_isShuttingDown{ false };
+        std::atomic<bool> m_renderShouldStop{ false };
 
         // Video seek slider / position label (updated per-tick while playing).
         winrt::Microsoft::UI::Xaml::Controls::Slider m_videoSeekSlider{ nullptr };
@@ -320,6 +448,8 @@ namespace winrt::ShaderLab::implementation
         float m_graphPanelDipsHeight{ 0.0f };
 
         void InitializeGraphPanel();
+        void EnsureUiD2dContext();
+        void ReleaseUiD2dContext();
         void ResizeGraphPanel(float widthDips, float heightDips);
         void UpdateGraphPanelScale();
         void RenderNodeGraph();
@@ -342,6 +472,21 @@ namespace winrt::ShaderLab::implementation
         D2D1_POINT_2F m_graphPanStart{};
         D2D1_POINT_2F m_graphPanOrigin{};
         void UpdatePropertiesPanel();
+
+        // Look up a node either in the latest published GraphUiSnapshot (if
+        // one has been published) or in the live graph (fallback during
+        // pre-first-render startup). Used by UI code paths that need to read
+        // runtime state -- runtimeError, analysisOutput -- which are written
+        // by the evaluator and would race on direct m_graph reads once the
+        // render thread spawns. Note: this returns a pointer into the
+        // snapshot which is owned by a shared_ptr; the caller should keep
+        // the snapshot alive (e.g., via a local copy) for the duration of
+        // their reads.
+        std::shared_ptr<const ::ShaderLab::Graph::GraphUiSnapshot>
+            CurrentGraphSnapshot() const
+        {
+            return std::atomic_load(&m_uiGraphSnapshot);
+        }
         // True when any descendant of PropertiesPanel currently has keyboard
         // focus (TextBox cursor, NumberBox edit, dropdown open). Used by the
         // 4 Hz binding-value refresh path to avoid clobbering an in-progress
@@ -471,6 +616,10 @@ namespace winrt::ShaderLab::implementation
         void UpdateMcpActivityIndicator();
         void ResetMcpActivityState();
         void UpdateFpsTooltip();
+        // Canonical FPS / timing strings shared by the main status bar and
+        // every output window. Single source of truth.
+        std::wstring BuildFpsStatusText() const;
+        std::wstring BuildFpsTooltipText() const;
 
         // Column splitter drag state.
         bool m_isDraggingSplitter{ false };

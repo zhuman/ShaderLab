@@ -252,13 +252,25 @@ namespace ShaderLab::Effects
     }
 
     IFACEMETHODIMP CustomPixelShaderEffect::MapOutputRectToInputRects(
-        const D2D1_RECT_L* outputRect,
+        const D2D1_RECT_L* /*outputRect*/,
         D2D1_RECT_L* inputRects,
         UINT32 inputRectCount) const
     {
-        // Return the FULL clamped output rect (not the clipped viewport).
-        // This ensures the intermediate textures match the output rect,
-        // so TEXCOORD maps 1:1 with GetDimensions() normalization.
+        // Always return the FULL output rect as the input demand, ignoring
+        // the queried sub-rect. This is the safe-with-TRIVIAL_SAMPLING
+        // baseline: it ensures the intermediate textures match the full
+        // effect output rect so TEXCOORD maps 1:1 with GetDimensions()-
+        // normalized math, and so thumbnail / sub-rect previews show the
+        // *whole* effect output rather than just the queried region.
+        //
+        // An earlier attempt at honoring the queried sub-rect to enable
+        // D2Ds lazy-eval propagation (for preview-resolution scaling and
+        // per-input-rect routing) caused the symptom that thumbnail-
+        // sized preview panes rendered only a small sub-rect of the
+        // chain into the upper-left of the canvas. Reverted; preview-
+        // resolution scaling is shipped as the explicit Scale catalog
+        // node instead, which constrains the source-side rect rather
+        // than relying on leaf-side sub-rect demand propagation.
         for (UINT32 i = 0; i < inputRectCount; ++i)
         {
             inputRects[i] = m_lastOutputRect;

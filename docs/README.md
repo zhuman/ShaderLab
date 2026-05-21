@@ -11,6 +11,7 @@ The repo root [README.md](../README.md) covers identity, install, and getting-st
 Reference for "how does ShaderLab work under the hood".
 
 - [Architecture Overview](architecture/overview.md) — high-level diagram of the components (rendering, graph, effects, UI controllers, hosts).
+- [Threading Model](architecture/threading-model.md) — UI thread vs render worker, offscreen-blit composition, dispatcher, output-window sinks.
 - [Pipeline Format Strategy](architecture/pipeline-format.md) — why the pipeline is always scRGB FP16 and how DWM/ACM handles the final display conversion.
 - [Effect Graph Model](architecture/effect-graph-model.md) — `EffectGraph` / `EffectNode` / `EffectEdge` / `PropertyValue`, JSON serialization, dirty tracking.
 - [Topological Evaluation](architecture/topological-evaluation.md) — Kahn's algorithm, evaluation order, cycle detection.

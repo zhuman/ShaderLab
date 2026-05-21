@@ -25,7 +25,13 @@ namespace ShaderLab::Controls
         m_dxgiFactory = dxgiFactory;
         m_nodeId = nodeId;
         m_format = format;
-        m_fpsTime = std::chrono::steady_clock::now();
+
+        // P7: create the cross-thread sink. Render worker pushes-ref via
+        // MainWindow::m_outputSinks; UI thread mutates view state under
+        // m_sink->viewMutex. The shared_ptr keeps it alive across thread
+        // boundaries even if the UI thread closes the window mid-render.
+        m_sink = std::make_shared<OutputSinkRenderState>();
+        m_sink->nodeId = nodeId;
 
         try
         {
@@ -58,7 +64,7 @@ namespace ShaderLab::Controls
             MUXC::Grid::SetRow(statusBar, 1);
 
             m_fpsText = MUXC::TextBlock();
-            m_fpsText.Text(L"0 FPS");
+            m_fpsText.Text(L"-- fps");
             m_fpsText.Foreground(MUX::Media::SolidColorBrush(
                 winrt::Windows::UI::Color{ 255, 180, 180, 180 }));
             m_fpsText.FontSize(11);
@@ -155,6 +161,19 @@ namespace ShaderLab::Controls
                 try
                 {
                     ResizeForPanelSize(m_panel.ActualWidth(), m_panel.ActualHeight());
+
+                    // P7: push initial size into the sink so the worker can
+                    // create offscreen buffers immediately. Without this the
+                    // worker waits one UI tick for SyncSinkFromUi to push
+                    // the size and the first frame would render as black.
+                    if (m_sink)
+                    {
+                        std::scoped_lock lock(m_sink->viewMutex);
+                        m_sink->requestedW = m_width;
+                        m_sink->requestedH = m_height;
+                        m_sink->compositionScale =
+                            static_cast<float>(m_panel.CompositionScaleX());
+                    }
 
                     m_sizeChangedToken = m_panel.SizeChanged(
                         { this, &OutputWindow::OnPanelSizeChanged });
@@ -311,20 +330,11 @@ namespace ShaderLab::Controls
             dc->SetDpi(oldDpiX, oldDpiY);
             dc->SetTransform(&oldTransform);
 
-            // Update FPS counter.
-            m_frameCount++;
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration<double>(now - m_fpsTime).count();
-            if (elapsed >= 1.0)
-            {
-                uint32_t fps = static_cast<uint32_t>(m_frameCount / elapsed);
-                if (m_timingText.empty())
-                    m_fpsText.Text(std::to_wstring(fps) + L" FPS");
-                else
-                    m_fpsText.Text(std::format(L"{} FPS | {}", fps, m_timingText));
-                m_frameCount = 0;
-                m_fpsTime = now;
-            }
+            // FPS / timing display is driven by SetStatusText from the main
+            // window so all windows show the same numbers in the same
+            // format. No per-window counter -- every render tick presents
+            // to all output windows synchronously, so per-window FPS would
+            // be redundant.
         }
         catch (const winrt::hresult_error& ex)
         {
@@ -337,6 +347,16 @@ namespace ShaderLab::Controls
     void OutputWindow::Close()
     {
         m_isOpen = false;
+        // P7: signal to the render worker that this sink is gone. Worker
+        // checks `closed` under viewMutex before rendering and skips. UI
+        // side keeps the shared_ptr alive long enough that any in-flight
+        // render-thread iteration can finish accessing the buffers without
+        // a use-after-free.
+        if (m_sink)
+        {
+            std::scoped_lock lock(m_sink->viewMutex);
+            m_sink->closed = true;
+        }
         ReleaseRenderTarget();
         m_swapChain = nullptr;
 
@@ -365,9 +385,23 @@ namespace ShaderLab::Controls
             m_window.Title(winrt::hstring(title));
     }
 
-    void OutputWindow::SetTimingText(const std::wstring& text)
+    void OutputWindow::SetStatusText(const std::wstring& text)
     {
-        m_timingText = text;
+        if (m_fpsText)
+            m_fpsText.Text(winrt::hstring(text));
+    }
+
+    void OutputWindow::SetStatusTooltip(const std::wstring& tooltip)
+    {
+        if (!m_fpsText) return;
+        // Wrap the tooltip text in a monospace TextBlock for readability.
+        namespace MUX = winrt::Microsoft::UI::Xaml;
+        namespace MUXC = winrt::Microsoft::UI::Xaml::Controls;
+        auto tb = MUXC::TextBlock();
+        tb.FontFamily(MUX::Media::FontFamily(L"Cascadia Mono, Consolas, Courier New"));
+        tb.FontSize(11);
+        tb.Text(winrt::hstring(tooltip));
+        MUXC::ToolTipService::SetToolTip(m_fpsText, tb);
     }
 
     void OutputWindow::CreateSwapChain()
@@ -616,5 +650,176 @@ namespace ShaderLab::Controls
                 m_fpsText.Text(L"Saved: " + file.Name());
         }
         catch (...) {}
+    }
+
+    // -----------------------------------------------------------------------
+    // P7: cross-thread output rendering
+    // -----------------------------------------------------------------------
+
+    void OutputWindow::SyncSinkFromUi()
+    {
+        // UI thread. Push the current view state into the sink so the render
+        // thread sees a coherent snapshot when it draws into this window's
+        // offscreen pair. Called once per UI tick before BlitAndPresent.
+        if (!m_sink) return;
+        std::scoped_lock lock(m_sink->viewMutex);
+        m_sink->requestedW = m_width;
+        m_sink->requestedH = m_height;
+        m_sink->compositionScale = m_panel
+            ? static_cast<float>(m_panel.CompositionScaleX())
+            : 1.0f;
+        m_sink->panX       = m_panX;
+        m_sink->panY       = m_panY;
+        m_sink->zoom       = m_zoom;
+        m_sink->autoFit    = m_autoFit;
+        m_sink->needsFit   = m_needsFit;
+        // m_needsFit is one-shot: clear it on UI side after publishing so
+        // the render thread only fits once per request.
+        m_needsFit         = false;
+    }
+
+    void OutputWindow::BlitAndPresent(ID2D1DeviceContext5* uiDc)
+    {
+        // UI thread. If the worker has published a new offscreen frame,
+        // wrap it in a UI-context-bound source bitmap and DrawImage into
+        // this window's swap chain back buffer with a fit-to-panel
+        // transform, then Present1.
+        if (!m_isOpen || !m_swapChain || !uiDc || !m_sink) return;
+
+        // Refresh m_width/m_height from the current panel state. The
+        // SizeChanged handler is hooked at the END of the panel's Loaded
+        // callback, so layout passes that happen between window activation
+        // and handler attachment are missed -- the swap chain stays at the
+        // initial Loaded-time size forever, even though the panel actually
+        // sits at a different layout size. Rechecking here every tick is
+        // cheap and lets us catch any missed resize.
+        if (m_panel)
+        {
+            try
+            {
+                double scale = static_cast<double>(m_panel.CompositionScaleX());
+                uint32_t w = static_cast<uint32_t>(
+                    (std::max)(1.0, m_panel.ActualWidth() * scale));
+                uint32_t h = static_cast<uint32_t>(
+                    (std::max)(1.0, m_panel.ActualHeight() * scale));
+                if (w > 0 && h > 0 && (w != m_width || h != m_height))
+                {
+                    m_width = w;
+                    m_height = h;
+                    m_needsResize = true;
+                    m_needsFit = true;
+                }
+            }
+            catch (...) {}
+        }
+
+        // Handle pending swap-chain resize before consuming a frame.
+        if (m_needsResize)
+        {
+            m_needsResize = false;
+            if (m_width > 0 && m_height > 0)
+            {
+                HRESULT hr = m_swapChain->ResizeBuffers(0, m_width, m_height,
+                    DXGI_FORMAT_UNKNOWN, 0);
+                if (FAILED(hr)) return;
+            }
+        }
+
+        const int32_t idx = m_sink->publishedIdx.load(std::memory_order_acquire);
+        if (idx < 0 || idx > 1) return;
+
+        // Lazy rebuild of UI-side source wrappers when bufferGen changes
+        // (size change). Wrappers must be created on the UI D2D context.
+        const uint64_t bufGen = m_sink->bufferGen.load(std::memory_order_acquire);
+        if (bufGen != m_sink->uiObservedGen ||
+            !m_sink->uiSources[0] || !m_sink->uiSources[1])
+        {
+            const auto& fmt = m_format;
+            D2D1_BITMAP_PROPERTIES1 sp = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_NONE,
+                D2D1::PixelFormat(fmt.dxgiFormat, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                96.0f, 96.0f);
+            for (uint32_t i = 0; i < 2; ++i)
+            {
+                m_sink->uiSources[i] = nullptr;
+                if (!m_sink->textures[i]) continue;
+                winrt::com_ptr<IDXGISurface> surface;
+                if (SUCCEEDED(m_sink->textures[i]->QueryInterface(
+                        IID_PPV_ARGS(surface.put()))))
+                {
+                    uiDc->CreateBitmapFromDxgiSurface(
+                            surface.get(), sp, m_sink->uiSources[i].put());
+                }
+            }
+            m_sink->uiObservedGen = bufGen;
+            // First frame after resize / first paint -- recompute fit so
+            // the image is centered in the new panel size.
+            m_needsFit = true;
+        }
+
+        auto* sourceBitmap = m_sink->uiSources[idx].get();
+        if (!sourceBitmap) return;
+
+        // Cache for SaveImageAsync. The source bitmap wraps the worker's
+        // offscreen texture; the wrapper lifetime is governed by uiSources
+        // (rebuilt on bufferGen change). Storing a raw pointer here is safe
+        // for the duration of this BlitAndPresent and the subsequent UI
+        // tick where Save is most likely to fire.
+        m_lastImage = sourceBitmap;
+
+        winrt::com_ptr<IDXGISurface> backBuffer;
+        HRESULT hr = m_swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.put()));
+        if (FAILED(hr)) return;
+
+        D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(m_format.dxgiFormat, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            96.0f, 96.0f);
+        winrt::com_ptr<ID2D1Bitmap1> bbBitmap;
+        hr = uiDc->CreateBitmapFromDxgiSurface(backBuffer.get(), bp, bbBitmap.put());
+        if (FAILED(hr)) return;
+
+        // Auto-fit: compute zoom + pan in DIP space so the image is
+        // centered with full coverage. m_panX/m_panY/m_zoom are also the
+        // values used by the pointer-input handlers, so the user can
+        // manually pan/zoom from this baseline.
+        D2D1_SIZE_F srcSize = sourceBitmap->GetSize();
+        if ((m_needsFit || m_autoFit) &&
+            srcSize.width > 0 && srcSize.height > 0 && m_panel)
+        {
+            m_needsFit = false;
+            float vpDipW = static_cast<float>(m_panel.ActualWidth());
+            float vpDipH = static_cast<float>(m_panel.ActualHeight());
+            if (vpDipW > 0 && vpDipH > 0)
+            {
+                m_zoom = (std::min)(vpDipW / srcSize.width,
+                                    vpDipH / srcSize.height);
+                m_panX = (vpDipW - srcSize.width  * m_zoom) * 0.5f;
+                m_panY = (vpDipH - srcSize.height * m_zoom) * 0.5f;
+            }
+        }
+
+        // Render in panel-DIP space; SetDpi scales to physical pixels.
+        float dpi = 96.0f * (m_panel
+            ? static_cast<float>(m_panel.CompositionScaleX())
+            : 1.0f);
+        uiDc->SetTarget(bbBitmap.get());
+        uiDc->SetDpi(dpi, dpi);
+        uiDc->SetTransform(D2D1::Matrix3x2F::Identity());
+        uiDc->BeginDraw();
+        uiDc->Clear(D2D1::ColorF(D2D1::ColorF::Black));
+
+        uiDc->SetTransform(
+            D2D1::Matrix3x2F::Scale(m_zoom, m_zoom) *
+            D2D1::Matrix3x2F::Translation(m_panX, m_panY));
+        uiDc->DrawImage(sourceBitmap);
+        uiDc->SetTransform(D2D1::Matrix3x2F::Identity());
+
+        hr = uiDc->EndDraw();
+        uiDc->SetTarget(nullptr);
+        if (FAILED(hr)) return;
+
+        DXGI_PRESENT_PARAMETERS params{};
+        m_swapChain->Present1(1, 0, &params);
     }
 }

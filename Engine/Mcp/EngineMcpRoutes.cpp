@@ -905,6 +905,390 @@ namespace ShaderLab::Mcp
                 });
         }
 
+        // ---- POST /graph/apply ---------------------------------------------
+        // Bulk graph-construction primitive. Body shape:
+        //   {
+        //     "clear": true,                                   // optional; default false
+        //     "nodes":    [ { "ref": "video", "effect": "Video", "properties": {...} }, ... ],
+        //     "edges":    [ { "from": "video", "to": "scale", "fromPin": 0, "toPin": 0 }, ... ],
+        //     "bindings": [ { "node": "tonemap", "property": "InputMaxLuminance",
+        //                     "from": "lum.Max", "component": 0 }, ... ],
+        //     "previewNode": "split"                           // optional
+        //   }
+        // `ref` is a client-supplied symbolic name (string). The route resolves
+        // refs to server-assigned node IDs as it goes, so the caller never has
+        // to round-trip through add-node responses to wire the rest of the graph.
+        // Edges/bindings can also use raw numeric IDs to mix with hand-managed
+        // nodes; refs and numeric IDs are interchangeable in those positions.
+        // The whole closure runs as a single render-thread dispatch -- atomic
+        // either succeeds or fails as one unit.
+        void RegisterApply(McpHttpServer& server, IEngineCommandSink& sink)
+        {
+            server.AddRoute(L"POST", L"/graph/apply",
+                [&sink](const std::wstring&, const std::string& body) -> McpHttpServer::Response
+                {
+                    return sink.Dispatch([&body, &sink](EngineContext& ctx) -> McpHttpServer::Response {
+                        WDJ::JsonObject root;
+                        try { root = WDJ::JsonObject::Parse(winrt::to_hstring(body)); }
+                        catch (...) { return Json(400, R"({"error":"Invalid JSON"})"); }
+
+                        // Note: an in-patch `clear` flag was removed because
+                        // re-entering ctx.graph->Clear() from inside an
+                        // already-dispatched closure proved fragile (D2D
+                        // teardown races subsequent AddNode calls). Callers
+                        // wanting a fresh graph should call /graph/clear
+                        // first, then /graph/apply.
+
+                        std::map<std::wstring, uint32_t> refToId;
+                        std::vector<uint32_t> orderedIds;
+
+                        // Resolve a JSON value to a node id: numeric -> id directly,
+                        // string -> lookup in refToId. Returns 0 + error on miss.
+                        auto resolveNode = [&](WDJ::IJsonValue const& v, const char* what,
+                                               uint32_t* outId, std::string* err) -> bool
+                        {
+                            if (v.ValueType() == WDJ::JsonValueType::Number)
+                            {
+                                *outId = static_cast<uint32_t>(v.GetNumber());
+                                return true;
+                            }
+                            if (v.ValueType() == WDJ::JsonValueType::String)
+                            {
+                                auto s = std::wstring(v.GetString());
+                                auto it = refToId.find(s);
+                                if (it == refToId.end())
+                                {
+                                    *err = std::string("Unknown ") + what + " ref: " +
+                                           WideToUtf8(s);
+                                    return false;
+                                }
+                                *outId = it->second;
+                                return true;
+                            }
+                            *err = std::string("Expected number or string for ") + what;
+                            return false;
+                        };
+
+                        // Helper: write a JSON value into an EffectNode property,
+                        // mirroring /graph/set-property's number/bool/string/array
+                        // type-fanout. Used for both the per-node `properties`
+                        // block at create time and any later patch.
+                        auto writeProperty = [&](Graph::EffectNode& node,
+                            const std::wstring& key, WDJ::IJsonValue const& val)
+                        {
+                            switch (val.ValueType())
+                            {
+                            case WDJ::JsonValueType::Number:
+                            {
+                                bool isUint = false;
+                                if (node.customEffect.has_value())
+                                {
+                                    for (const auto& p : node.customEffect->parameters)
+                                    {
+                                        if (p.name == key && p.typeName == L"uint")
+                                        { isUint = true; break; }
+                                    }
+                                }
+                                auto existIt = node.properties.find(key);
+                                if (existIt != node.properties.end() &&
+                                    std::holds_alternative<uint32_t>(existIt->second))
+                                    isUint = true;
+                                if (isUint)
+                                    node.properties[key] = static_cast<uint32_t>(val.GetNumber());
+                                else
+                                    node.properties[key] = static_cast<float>(val.GetNumber());
+                                break;
+                            }
+                            case WDJ::JsonValueType::Boolean:
+                                node.properties[key] = val.GetBoolean();
+                                break;
+                            case WDJ::JsonValueType::String:
+                                node.properties[key] = std::wstring(val.GetString());
+                                break;
+                            case WDJ::JsonValueType::Array:
+                            {
+                                auto arr = val.GetArray();
+                                if (arr.Size() == 2)
+                                    node.properties[key] = winrt::Windows::Foundation::Numerics::float2{
+                                        static_cast<float>(arr.GetAt(0).GetNumber()),
+                                        static_cast<float>(arr.GetAt(1).GetNumber()) };
+                                else if (arr.Size() == 3)
+                                    node.properties[key] = winrt::Windows::Foundation::Numerics::float3{
+                                        static_cast<float>(arr.GetAt(0).GetNumber()),
+                                        static_cast<float>(arr.GetAt(1).GetNumber()),
+                                        static_cast<float>(arr.GetAt(2).GetNumber()) };
+                                else if (arr.Size() == 4)
+                                    node.properties[key] = winrt::Windows::Foundation::Numerics::float4{
+                                        static_cast<float>(arr.GetAt(0).GetNumber()),
+                                        static_cast<float>(arr.GetAt(1).GetNumber()),
+                                        static_cast<float>(arr.GetAt(2).GetNumber()),
+                                        static_cast<float>(arr.GetAt(3).GetNumber()) };
+                                break;
+                            }
+                            default: break;
+                            }
+
+                            // Mirror of the special-case property handling in
+                            // /graph/set-property -- preserve runtime fields.
+                            if (key == L"isPlaying" || key == L"IsPlaying")
+                            {
+                                if (auto* bv = std::get_if<bool>(&node.properties[key]))
+                                    node.isPlaying = *bv;
+                            }
+                            if (key == L"shaderPath")
+                            {
+                                if (auto* sv = std::get_if<std::wstring>(&node.properties[key]))
+                                    node.shaderPath = *sv;
+                            }
+                        };
+
+                        // ---- nodes -----------------------------------------------
+                        if (root.HasKey(L"nodes"))
+                        {
+                            auto nodesArr = root.GetNamedArray(L"nodes");
+                            for (uint32_t i = 0; i < nodesArr.Size(); ++i)
+                            {
+                                auto entry = nodesArr.GetObjectAt(i);
+                                if (!entry.HasKey(L"effect"))
+                                    return Json(400,
+                                        std::string("{\"error\":\"nodes[") + std::to_string(i) +
+                                        "] missing 'effect'\"}");
+                                auto effectName = entry.GetNamedString(L"effect");
+
+                                Graph::EffectNode node;
+                                bool created = false;
+
+                                if (auto* slDesc = ::ShaderLab::Effects::ShaderLabEffects::Instance().FindByName(effectName))
+                                {
+                                    node = ::ShaderLab::Effects::ShaderLabEffects::CreateNode(*slDesc);
+                                    created = true;
+                                }
+                                else if (auto* eDesc = ::ShaderLab::Effects::EffectRegistry::Instance().FindByName(effectName))
+                                {
+                                    node = ::ShaderLab::Effects::EffectRegistry::CreateNode(*eDesc);
+                                    created = true;
+                                }
+                                else if (effectName == L"Video Source" || effectName == L"Video")
+                                {
+                                    std::wstring filePath;
+                                    if (entry.HasKey(L"filePath"))
+                                        filePath = std::wstring(entry.GetNamedString(L"filePath"));
+                                    auto displayName = filePath.empty()
+                                        ? std::wstring(L"Video Source")
+                                        : filePath.substr(filePath.find_last_of(L"\\/") + 1);
+                                    node = ::ShaderLab::Effects::SourceNodeFactory::CreateVideoSourceNode(
+                                        filePath, displayName);
+                                    created = true;
+                                }
+                                else if (effectName == L"Image Source" || effectName == L"Image")
+                                {
+                                    std::wstring filePath;
+                                    if (entry.HasKey(L"filePath"))
+                                        filePath = std::wstring(entry.GetNamedString(L"filePath"));
+                                    auto displayName = filePath.empty()
+                                        ? std::wstring(L"Image Source")
+                                        : filePath.substr(filePath.find_last_of(L"\\/") + 1);
+                                    node = ::ShaderLab::Effects::SourceNodeFactory::CreateImageSourceNode(
+                                        filePath, displayName);
+                                    created = true;
+                                }
+                                else if (effectName == L"Output")
+                                {
+                                    // Output node: graph terminator + sink for an
+                                    // OutputWindow on hosts that have one. Engine-pure
+                                    // hosts (headless / tests) just keep it as graph
+                                    // metadata; the GUI host's OnNodeAdded hook detects
+                                    // the new Output and opens a SwapChainPanel-bound
+                                    // window for it.
+                                    node = ::ShaderLab::Effects::EffectRegistry::CreateOutputNode();
+                                    auto outputIds = ctx.graph->GetOutputNodeIds();
+                                    node.name = outputIds.empty()
+                                        ? std::wstring(L"Output")
+                                        : (L"Output " + std::to_wstring(outputIds.size() + 1));
+                                    created = true;
+                                }
+
+                                if (!created)
+                                {
+                                    return Json(400,
+                                        std::string("{\"error\":\"nodes[") + std::to_string(i) +
+                                        "] unknown effect: " + WideToUtf8(effectName) + "\"}");
+                                }
+
+                                // Apply per-node properties (after default-construction
+                                // so user values override descriptor defaults).
+                                if (entry.HasKey(L"properties") &&
+                                    entry.GetNamedValue(L"properties").ValueType() == WDJ::JsonValueType::Object)
+                                {
+                                    auto propsObj = entry.GetNamedObject(L"properties");
+                                    for (auto kv : propsObj)
+                                        writeProperty(node, std::wstring(kv.Key()), kv.Value());
+                                }
+
+                                auto id = ctx.graph->AddNode(std::move(node));
+                                orderedIds.push_back(id);
+
+                                // For Video/Image with filePath, kick off PrepareSourceNode
+                                // exactly as /graph/add-node does. (PrepareSourceNode is a
+                                // no-op without a context; harmless on headless.)
+                                if ((effectName == L"Video Source" || effectName == L"Video" ||
+                                     effectName == L"Image Source" || effectName == L"Image") &&
+                                    entry.HasKey(L"filePath") && ctx.sourceFactory && ctx.dc)
+                                {
+                                    if (auto* graphNode = ctx.graph->FindNode(id))
+                                        ctx.sourceFactory->PrepareSourceNode(*graphNode,
+                                            static_cast<ID2D1DeviceContext5*>(ctx.dc), 0.0,
+                                            ctx.d3dDevice, ctx.d3dContext);
+                                }
+
+                                if (entry.HasKey(L"ref") &&
+                                    entry.GetNamedValue(L"ref").ValueType() == WDJ::JsonValueType::String)
+                                {
+                                    auto refKey = std::wstring(entry.GetNamedString(L"ref"));
+                                    refToId[refKey] = id;
+                                }
+
+                                sink.OnNodeAdded(id);
+                            }
+                        }
+
+                        // ---- edges -----------------------------------------------
+                        if (root.HasKey(L"edges"))
+                        {
+                            auto edgesArr = root.GetNamedArray(L"edges");
+                            for (uint32_t i = 0; i < edgesArr.Size(); ++i)
+                            {
+                                auto e = edgesArr.GetObjectAt(i);
+                                if (!e.HasKey(L"from") || !e.HasKey(L"to"))
+                                    return Json(400,
+                                        std::string("{\"error\":\"edges[") + std::to_string(i) +
+                                        "] missing 'from' or 'to'\"}");
+                                uint32_t srcId = 0, dstId = 0;
+                                std::string err;
+                                if (!resolveNode(e.GetNamedValue(L"from"), "edge source", &srcId, &err))
+                                    return Json(400, "{\"error\":\"" + err + "\"}");
+                                if (!resolveNode(e.GetNamedValue(L"to"), "edge dest", &dstId, &err))
+                                    return Json(400, "{\"error\":\"" + err + "\"}");
+                                uint32_t srcPin = e.HasKey(L"fromPin")
+                                    ? static_cast<uint32_t>(e.GetNamedNumber(L"fromPin")) : 0;
+                                uint32_t dstPin = e.HasKey(L"toPin")
+                                    ? static_cast<uint32_t>(e.GetNamedNumber(L"toPin")) : 0;
+                                if (!ctx.graph->Connect(srcId, srcPin, dstId, dstPin))
+                                    return Json(400,
+                                        std::string("{\"error\":\"edges[") + std::to_string(i) +
+                                        "] Connect failed (cycle or invalid pin)\"}");
+                            }
+                        }
+
+                        // ---- bindings --------------------------------------------
+                        if (root.HasKey(L"bindings"))
+                        {
+                            auto bArr = root.GetNamedArray(L"bindings");
+                            for (uint32_t i = 0; i < bArr.Size(); ++i)
+                            {
+                                auto b = bArr.GetObjectAt(i);
+                                if (!b.HasKey(L"node") || !b.HasKey(L"property") || !b.HasKey(L"from"))
+                                    return Json(400,
+                                        std::string("{\"error\":\"bindings[") + std::to_string(i) +
+                                        "] missing one of node/property/from\"}");
+                                uint32_t dstId = 0;
+                                std::string err;
+                                if (!resolveNode(b.GetNamedValue(L"node"), "binding node", &dstId, &err))
+                                    return Json(400, "{\"error\":\"" + err + "\"}");
+                                auto prop = std::wstring(b.GetNamedString(L"property"));
+
+                                // `from` is "ref.fieldName" (string) or { "node": ..., "field": ... }.
+                                uint32_t srcId = 0;
+                                std::wstring fieldName;
+                                auto fromVal = b.GetNamedValue(L"from");
+                                if (fromVal.ValueType() == WDJ::JsonValueType::String)
+                                {
+                                    auto s = std::wstring(fromVal.GetString());
+                                    auto dot = s.find(L'.');
+                                    if (dot == std::wstring::npos)
+                                        return Json(400,
+                                            std::string("{\"error\":\"bindings[") + std::to_string(i) +
+                                            "] 'from' must be 'ref.fieldName'\"}");
+                                    auto refPart = s.substr(0, dot);
+                                    fieldName = s.substr(dot + 1);
+                                    auto it = refToId.find(refPart);
+                                    if (it == refToId.end())
+                                    {
+                                        // Maybe it's a numeric ID baked in.
+                                        try { srcId = static_cast<uint32_t>(std::stoul(WideToUtf8(refPart))); }
+                                        catch (...)
+                                        {
+                                            return Json(400,
+                                                "{\"error\":\"Unknown binding source ref: " +
+                                                WideToUtf8(refPart) + "\"}");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        srcId = it->second;
+                                    }
+                                }
+                                else if (fromVal.ValueType() == WDJ::JsonValueType::Object)
+                                {
+                                    auto fromObj = fromVal.GetObject();
+                                    if (!fromObj.HasKey(L"node") || !fromObj.HasKey(L"field"))
+                                        return Json(400,
+                                            std::string("{\"error\":\"bindings[") + std::to_string(i) +
+                                            "] 'from' object missing node/field\"}");
+                                    if (!resolveNode(fromObj.GetNamedValue(L"node"),
+                                                     "binding source", &srcId, &err))
+                                        return Json(400, "{\"error\":\"" + err + "\"}");
+                                    fieldName = std::wstring(fromObj.GetNamedString(L"field"));
+                                }
+                                else
+                                {
+                                    return Json(400,
+                                        std::string("{\"error\":\"bindings[") + std::to_string(i) +
+                                        "] 'from' must be string or object\"}");
+                                }
+
+                                uint32_t component = b.HasKey(L"component")
+                                    ? static_cast<uint32_t>(b.GetNamedNumber(L"component")) : 0;
+
+                                auto bindErr = ctx.graph->BindProperty(
+                                    dstId, prop, srcId, fieldName, component);
+                                if (!bindErr.empty())
+                                    return Json(400,
+                                        std::string("{\"error\":\"bindings[") + std::to_string(i) +
+                                        "]: " + WideToUtf8(bindErr) + "\"}");
+                            }
+                        }
+
+                        ctx.graph->MarkAllDirty();
+                        sink.OnGraphStructureChanged();
+
+                        // ---- previewNode (optional) ------------------------------
+                        // We deliberately don't poke a preview-node id from inside
+                        // this engine route -- preview is a host-side UI concept
+                        // (see /render/preview-node in the gui host's MCP routes).
+                        // Callers wanting a preview should make a follow-up call.
+
+                        // Build response: { ok, refToId: {...}, nodeIds: [...] }
+                        std::string out = "{\"ok\":true,\"nodeIds\":[";
+                        for (size_t i = 0; i < orderedIds.size(); ++i)
+                        {
+                            if (i) out += ",";
+                            out += std::to_string(orderedIds[i]);
+                        }
+                        out += "],\"refToId\":{";
+                        bool first = true;
+                        for (const auto& [k, v] : refToId)
+                        {
+                            if (!first) out += ",";
+                            out += "\"" + JsonEscape(WideToUtf8(k)) + "\":" + std::to_string(v);
+                            first = false;
+                        }
+                        out += "}}";
+                        return Json(200, out);
+                    });
+                });
+        }
+
 
         void RegisterPixelRegion(McpHttpServer& server, IEngineCommandSink& sink)
         {
@@ -1629,6 +2013,7 @@ namespace ShaderLab::Mcp
         RegisterClear(server, sink);
         RegisterLoad(server, sink);
         RegisterSetProperty(server, sink);
+        RegisterApply(server, sink);
         RegisterPixelRegion(server, sink);
         RegisterGetGraph(server, sink);
         RegisterCustomEffects(server, sink);

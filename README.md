@@ -2,7 +2,7 @@
 
 **HDR / WCG / SDR shader effect development & debugging tool**
 
-A WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging Direct2D and Win2D shader effects with full HDR and wide color gamut support.
+A WinUI 3 desktop application (C++/WinRT) for developing, testing, and debugging Direct2D shader effects with full HDR and wide color gamut support.
 
 ---
 
@@ -52,7 +52,7 @@ The deep technical reference lives under [docs/](docs/README.md), organized by a
 
 | Area | Highlights |
 |---|---|
-| [Architecture](docs/README.md#architecture) | System overview, pipeline format, effect graph model, D2D/D3D11 hybrid compute, engine/host split |
+| [Architecture](docs/README.md#architecture) | System overview, threading model (UI thread + render worker), pipeline format, effect graph model, D2D/D3D11 hybrid compute, engine/host split |
 | [Effects](docs/README.md#effects) | Built-in catalog, Effect Designer, parameter / numeric / property-binding mechanics, working space |
 | [UI / UX](docs/README.md#ui--ux) | Graph editor, multi-output windows, animation, conditional parameter visibility |
 | [Hosts](docs/README.md#hosts) | ShaderLabHeadless console host, MCP server for AI agent integration |
@@ -76,7 +76,7 @@ Core capabilities:
 - **HDR / WCG aware** — DXGI adapter-change tracking, ICC profile parsing, monitor primaries piped into Custom-gamut analysis effects via the Working Space node.
 - **MCP server** + **headless host** for AI-agent and CI integration; the MCP route layer lives in `ShaderLabEngine.dll` so headless and GUI hosts share the route implementations.
 
-Build: Visual Studio 2022 17.8+, Windows 10 SDK 10.0.26100+, Win2D 1.3.0, C++/WinRT only (no C#).
+Build: Visual Studio 2022 17.8+, Windows 10 SDK 10.0.26100+, C++/WinRT only (no C#).
 
 ---
 

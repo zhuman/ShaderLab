@@ -104,111 +104,195 @@ namespace winrt::ShaderLab::implementation
         std::function<::ShaderLab::McpHttpServer::Response(
             ::ShaderLab::Mcp::EngineContext&)> closure)
     {
-        // Marshal the engine work to the UI thread so the closure
-        // doesn't race with the render tick mutating the same state.
-        // (Headless host's sink runs the closure synchronously on the
-        // listener thread; for that host the McpHttpServer's listener
-        // thread is the only consumer of the engine state.)
-        return window->DispatchSync([this, &closure]() -> ::ShaderLab::McpHttpServer::Response {
-            ::ShaderLab::Mcp::EngineContext ctx{};
-            ctx.graph = &window->m_graph;
-            ctx.evaluator = &window->m_graphEvaluator;
-            ctx.displayMonitor = &window->m_displayMonitor;
-            ctx.sourceFactory = &window->m_sourceFactory;
-            ctx.dc = window->m_renderEngine.D2DDeviceContext();
-            ctx.d3dDevice = window->m_renderEngine.D3DDevice();
-            ctx.d3dContext = window->m_renderEngine.D3DContext();
-            ctx.renderFrame = [this]() { window->RenderFrame(); };
-            ctx.getPreviewNodeId = [this]() -> uint32_t { return window->m_previewNodeId; };
-            ctx.getLoadedIccProfile = [this]() -> std::optional<::ShaderLab::Rendering::DisplayProfile> {
-                return window->m_loadedIccProfile;
-            };
-            ctx.setLoadedIccProfile = [this](const ::ShaderLab::Rendering::DisplayProfile& p) {
-                window->m_loadedIccProfile = p;
-            };
-            return closure(ctx);
+        // Marshal the engine work to the render thread (single writer to
+        // m_graph). Re-entrant calls from inside the consumer thread run
+        // inline (RenderThreadDispatcher detects this).
+        ::ShaderLab::McpHttpServer::Response resp;
+        try
+        {
+            resp = window->m_renderDispatcher.DispatchSync(
+                [this, &closure]() -> ::ShaderLab::McpHttpServer::Response {
+                    ::ShaderLab::Mcp::EngineContext ctx{};
+                    ctx.graph = &window->m_graph;
+                    ctx.evaluator = &window->m_graphEvaluator;
+                    ctx.displayMonitor = &window->m_displayMonitor;
+                    ctx.sourceFactory = &window->m_sourceFactory;
+                    // Closure runs on render thread now -- give it the render
+                    // D2D context so source-prep / evaluator ops it performs
+                    // share state with the per-frame render path.
+                    ctx.dc = window->m_renderEngine.RenderD2DContext();
+                    ctx.d3dDevice = window->m_renderEngine.D3DDevice();
+                    ctx.d3dContext = window->m_renderEngine.D3DContext();
+                    ctx.renderFrame = [this]() { window->RenderFrameToOffscreen(0.0); };
+                    ctx.getPreviewNodeId = [this]() -> uint32_t { return window->m_previewNodeId; };
+                    ctx.getLoadedIccProfile = [this]() -> std::optional<::ShaderLab::Rendering::DisplayProfile> {
+                        return window->m_loadedIccProfile;
+                    };
+                    ctx.setLoadedIccProfile = [this](const ::ShaderLab::Rendering::DisplayProfile& p) {
+                        window->m_loadedIccProfile = p;
+                    };
+                    return closure(ctx);
+                });
+        }
+        catch (const std::exception& e)
+        {
+            ::ShaderLab::McpHttpServer::Response err;
+            err.statusCode = 500;
+            err.body = std::string(R"({"error":")") + e.what() + R"("})";
+            err.contentType = "application/json";
+            return err;
+        }
+        return resp;
+    }
+
+    // Event hooks fire from inside Dispatch closures, which run on the
+    // render thread. Anything that touches XAML or UI-thread-only controllers
+    // must be marshalled back to the UI thread via DispatcherQueue().TryEnqueue.
+    //
+    // P7 race protection: NodeGraphController::AutoLayout / RebuildLayout
+    // iterate `m_graph.Nodes()` and each node's `properties` std::map. The
+    // render worker mutates those maps every tick (analysisOutput updates,
+    // clock advancement, source factory writes). To avoid use-after-free /
+    // iterator invalidation in std::map traversal, we run those layout
+    // calls THROUGH the render dispatcher with DispatchSync. The dispatcher
+    // drains queued closures BEFORE the worker's per-tick body, so when our
+    // closure runs the worker is implicitly paused -- m_graph is stable for
+    // the duration of the layout, and m_visuals isn't being concurrently
+    // read by the UI thread (which is blocked in DispatchSync).
+    static void RunLayoutOnRenderThread(::ShaderLab::Rendering::RenderThreadDispatcher& dispatcher,
+                                        std::function<void()> work)
+    {
+        dispatcher.DispatchSync([work = std::move(work)]() {
+            work();
         });
     }
 
-    // Event hooks. All of these run on the UI thread (the engine route's
-    // Dispatch closure already marshaled there). The implementations call
-    // the same UI methods MainWindow uses on native user interactions, so
-    // MCP-driven mutations take the same UI code path the user does.
-
-    void MainWindow::GuiEngineCommandSink::OnNodeAdded(uint32_t /*nodeId*/)
+    void MainWindow::GuiEngineCommandSink::OnNodeAdded(uint32_t nodeId)
     {
         window->m_graph.MarkAllDirty();
-        window->m_nodeGraphController.AutoLayout();
-        window->PopulatePreviewNodeSelector();
         window->m_forceRender = true;
+        // Detect Output nodes added via /graph/apply or other engine-side
+        // routes and auto-open a window for each. Engine-pure hosts don't
+        // care about windows; this sink runs only in the GUI host.
+        bool isOutput = false;
+        if (auto* n = window->m_graph.FindNode(nodeId))
+            isOutput = (n->type == ::ShaderLab::Graph::NodeType::Output);
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w, nodeId, isOutput]{
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.AutoLayout(); });
+            w->PopulatePreviewNodeSelector();
+            if (isOutput)
+            {
+                try { w->OpenOutputWindow(nodeId); } catch (...) {}
+            }
+        });
     }
 
     void MainWindow::GuiEngineCommandSink::OnNodeRemoved(uint32_t nodeId)
     {
         window->m_graphEvaluator.InvalidateNode(nodeId);
-        window->CloseOutputWindow(nodeId);
         window->m_graph.MarkAllDirty();
-        window->m_nodeGraphController.AutoLayout();
-        window->PopulatePreviewNodeSelector();
         window->m_forceRender = true;
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w, nodeId]{
+            w->CloseOutputWindow(nodeId);
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.AutoLayout(); });
+            w->PopulatePreviewNodeSelector();
+        });
     }
 
-    void MainWindow::GuiEngineCommandSink::OnNodeChanged(uint32_t /*nodeId*/)
+    void MainWindow::GuiEngineCommandSink::OnNodeChanged(uint32_t nodeId)
     {
         window->m_forceRender = true;
+
+        // If the changed node has any visibleWhen-conditional parameters,
+        // a property change might flip a pin's visibility. Rebuild the
+        // node-graph layout so new input pins materialize on the canvas.
+        //
+        // OnNodeChanged is already running inside a render-dispatcher
+        // closure (the /graph/set-property route DispatchSync's into the
+        // worker before invoking this hook), so it is safe to touch
+        // m_graph and m_nodeGraphController here directly -- the worker
+        // is paused for the duration. We just need to tell the controller
+        // to repaint via m_needsRedraw (set by RebuildLayout itself).
+        if (auto* n = window->m_graph.FindNode(nodeId))
+        {
+            if (n->customEffect.has_value())
+            {
+                for (const auto& p : n->customEffect->parameters)
+                {
+                    if (!p.visibleWhen.empty())
+                    {
+                        window->m_nodeGraphController.RebuildLayout();
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     void MainWindow::GuiEngineCommandSink::OnGraphCleared()
     {
         window->m_graphEvaluator.ReleaseCache();
-        window->m_outputWindows.clear();
         window->m_previewNodeId = 0;
         window->m_graph.MarkAllDirty();
-        window->m_nodeGraphController.AutoLayout();
-        window->PopulatePreviewNodeSelector();
         window->m_forceRender = true;
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w]{
+            w->m_outputWindows.clear();
+            // Also drop sinks so the render worker doesn't keep churning on
+            // closed windows. Without this the m_outputSinks vector grows
+            // unbounded across graph clear/load cycles.
+            {
+                std::scoped_lock lock(w->m_outputSinksMutex);
+                w->m_outputSinks.clear();
+            }
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.AutoLayout(); });
+            w->PopulatePreviewNodeSelector();
+        });
     }
 
     void MainWindow::GuiEngineCommandSink::OnGraphLoaded()
     {
-        // ResetAfterGraphLoad rebuilds the per-load UI state (heartbeats,
-        // output windows, preview selector). Same path the file-open dialog
-        // takes.
-        window->ResetAfterGraphLoad(/*reopenOutputWindows=*/true);
-        window->m_nodeGraphController.AutoLayout();
         window->m_forceRender = true;
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w]{
+            w->ResetAfterGraphLoad(/*reopenOutputWindows=*/true);
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.AutoLayout(); });
+        });
     }
 
     void MainWindow::GuiEngineCommandSink::OnGraphStructureChanged()
     {
-        // Edges or property bindings changed -- rebuild the canvas layout
-        // so any new connections render correctly. AutoLayout is the same
-        // call user-driven connect/disconnect uses.
-        window->m_nodeGraphController.AutoLayout();
         window->m_forceRender = true;
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w]{
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.AutoLayout(); });
+        });
     }
 
     void MainWindow::GuiEngineCommandSink::OnCustomEffectRecompiled(uint32_t /*nodeId*/)
     {
-        // Custom effect bytecode + parameters changed: rebuild the
-        // canvas layout (parameter pins may have changed), enforce
-        // unique effect names, and refresh the Add Node flyout. Same
-        // calls EffectDesignerWindow's "Update in Graph" path makes.
-        window->m_nodeGraphController.RebuildLayout();
-        window->PopulateAddNodeFlyout();
         window->m_forceRender = true;
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w]{
+            RunLayoutOnRenderThread(w->m_renderDispatcher,
+                [w]{ w->m_nodeGraphController.RebuildLayout(); });
+            w->PopulateAddNodeFlyout();
+        });
     }
 
     void MainWindow::GuiEngineCommandSink::OnDisplayProfileChanged()
     {
-        // MCP-driven profile change. Mirror what ApplyDisplayProfile /
-        // RevertToLiveDisplay do in the GUI's native paths so the
-        // status bar, profile dropdown, and frame state stay in sync.
-        // (Working Space nodes were already refreshed engine-side
-        // inside the route closure before this hook fired.)
         window->m_graph.MarkAllDirty();
         window->m_forceRender = true;
-        window->UpdateStatusBar();
+        auto* w = window;
+        w->DispatcherQueue().TryEnqueue([w]{ w->UpdateStatusBar(); });
     }
 
     void MainWindow::SetupMcpRoutes()
@@ -451,10 +535,13 @@ namespace winrt::ShaderLab::implementation
         m_mcpServer->AddRoute(L"GET", L"/render/capture", [this](const std::wstring&, const std::string&)
             -> ::ShaderLab::McpHttpServer::Response
         {
-            return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                // Force a full re-evaluation so the capture reflects current state.
+            return m_renderDispatcher.DispatchSync(
+                [this]() -> ::ShaderLab::McpHttpServer::Response {
+                // Run on render thread (single writer to graph + owns the
+                // engine D2D context). Force a full re-evaluation so the
+                // capture reflects current state.
                 m_graph.MarkAllDirty();
-                RenderFrame();
+                RenderFrameToOffscreen(0.0);
                 auto pngData = CapturePreviewAsPng();
                 if (pngData.empty())
                     return { 404, R"({"error":"No output image"})" };
@@ -492,21 +579,19 @@ namespace winrt::ShaderLab::implementation
             double fps = (t.totalUs > 0) ? 1000000.0 / t.totalUs : 0;
             return { 200, std::format(
                 "{{\"fps\":{:.1f},\"totalMs\":{:.2f},"
-                "\"videoTickMs\":{:.2f},"
                 "\"sourcesPrepMs\":{:.2f},\"evaluateMs\":{:.2f},"
                 "\"deferredComputeMs\":{:.2f},\"drawMs\":{:.2f},"
-                "\"presentMs\":{:.2f},"
-                "\"nodeGraphMs\":{:.2f},\"outputWindowsMs\":{:.2f},\"traceMs\":{:.2f},"
+                "\"endDrawFlushMs\":{:.2f},"
+                "\"uiTickMs\":{:.2f},\"outputWindowsMs\":{:.2f},\"traceMs\":{:.2f},"
                 "\"computeDispatches\":{},"
-                "\"framesSampled\":{}}}",
+                "\"framesSampled\":{},\"endDrawFailed\":{}}}",
                 fps, t.totalUs / 1000.0,
-                t.videoTickUs / 1000.0,
                 t.sourcesPrepUs / 1000.0, t.evaluateUs / 1000.0,
                 t.deferredComputeUs / 1000.0, t.drawUs / 1000.0,
-                t.presentUs / 1000.0,
-                t.nodeGraphUs / 1000.0, t.outputWindowsUs / 1000.0, t.traceUs / 1000.0,
+                t.endDrawFlushUs / 1000.0,
+                t.uiTickUs / 1000.0, t.outputWindowsUs / 1000.0, t.traceUs / 1000.0,
                 t.computeDispatches,
-                t.framesSampled) };
+                t.framesSampled, t.endDrawFailed) };
         });
 
         // =====================================================================
@@ -605,11 +690,30 @@ namespace winrt::ShaderLab::implementation
                 float normX = static_cast<float>(jobj.GetNamedNumber(L"x"));
                 float normY = static_cast<float>(jobj.GetNamedNumber(L"y"));
 
-                return DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
-                    auto* dc = m_renderEngine.D2DDeviceContext();
+                return m_renderDispatcher.DispatchSync([&]() -> ::ShaderLab::McpHttpServer::Response {
+                    // P13: pixel-trace runs on the render thread. m_graph is
+                    // single-writer there; the render-side D2D context shares
+                    // the engine's multi-threaded D2D device with the worker's
+                    // BeginDraw session. UI's PopulatePixelTraceTree also
+                    // routes its ReTrace through the render dispatcher, so
+                    // there's no concurrent access to m_pixelTrace state.
+                    auto* dc = m_renderEngine.RenderD2DContext();
                     if (!dc) return { 500, R"({"error":"No device context"})" };
 
-                    auto bounds = GetPreviewImageBounds();
+                    // Compute preview image bounds inline on render context
+                    // (can't call MainWindow::GetPreviewImageBounds, which
+                    // reads from the UI D2D context).
+                    auto* previewNode = m_graph.FindNode(m_previewNodeId);
+                    auto* previewImage = previewNode ? previewNode->cachedOutput : nullptr;
+                    if (!previewImage) return { 404, R"({"error":"No preview image"})" };
+                    float oldDpiX, oldDpiY;
+                    dc->GetDpi(&oldDpiX, &oldDpiY);
+                    dc->SetDpi(96.0f, 96.0f);
+                    D2D1_RECT_F bounds{};
+                    HRESULT bhr = dc->GetImageLocalBounds(previewImage, &bounds);
+                    dc->SetDpi(oldDpiX, oldDpiY);
+                    if (FAILED(bhr)) return { 500, R"({"error":"GetImageLocalBounds failed"})" };
+
                     uint32_t imageW = static_cast<uint32_t>(bounds.right - bounds.left);
                     uint32_t imageH = static_cast<uint32_t>(bounds.bottom - bounds.top);
                     if (imageW == 0 || imageH == 0)
@@ -1203,6 +1307,7 @@ namespace winrt::ShaderLab::implementation
 {"name":"graph_save_json","description":"Serialize graph to JSON","inputSchema":{"type":"object","properties":{}}},
 {"name":"graph_load_json","description":"Load graph from JSON string","inputSchema":{"type":"object","properties":{"json":{"type":"string"}},"required":["json"]}},
 {"name":"graph_clear","description":"Clear the graph","inputSchema":{"type":"object","properties":{}}},
+{"name":"graph_apply","description":"Apply a graph patch in one call: add nodes (using client refs), connect edges, set property bindings. Call /graph/clear first if you need a fresh graph. Body: { nodes:[{ref,effect,filePath?,properties?}], edges:[{from,to,fromPin?,toPin?}], bindings:[{node,property,from:'ref.field'|{node,field},component?}] }. 'from' and 'to' accept either a ref string or numeric nodeId. Returns refToId map + nodeIds in add order.","inputSchema":{"type":"object","properties":{"nodes":{"type":"array"},"edges":{"type":"array"},"bindings":{"type":"array"}}}},
 {"name":"effect_compile","description":"Compile HLSL for a custom effect node","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"},"hlsl":{"type":"string"}},"required":["nodeId","hlsl"]}},
 {"name":"set_preview_node","description":"Set which node is previewed","inputSchema":{"type":"object","properties":{"nodeId":{"type":"number"}},"required":["nodeId"]}},
 {"name":"render_capture","description":"Capture preview as PNG. Note: HDR values clipped to SDR.","inputSchema":{"type":"object","properties":{}}},
@@ -1272,6 +1377,8 @@ namespace winrt::ShaderLab::implementation
                     }
                     else if (toolName == "graph_clear")
                         restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/clear", "");
+                    else if (toolName == "graph_apply")
+                        restResp = m_mcpServer->RouteRequest(L"POST", L"/graph/apply", argsStr);
                     else if (toolName == "effect_compile")
                         restResp = m_mcpServer->RouteRequest(L"POST", L"/effect/compile", argsStr);
                     else if (toolName == "set_preview_node")
